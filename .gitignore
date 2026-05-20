@@ -1,0 +1,26 @@
+# Eval / iteration outputs (large, regeneratable)
+workspace/
+
+# Stale eval artifacts that might appear during dev
+**/iteration-*/
+**/skill-snapshot-*/
+**/eval_review_*.html
+**/feedback.json
+
+# Packaged skills (regenerated from each skill's SKILL.md)
+# Uncomment to keep them out of git, treating as build artifacts:
+# *.skill
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
