@@ -8,6 +8,7 @@
 |-------|------|
 | [prd-writer](prd-writer/) | 通过对话生成或迭代产品需求文档(PRD),主动追问、冲突检测、Mermaid 图表 |
 | [tech-design-writer](tech-design-writer/) | 把 PRD 翻译成中等深度的技术设计文档(架构图 + 技术栈 + 数据模型 + 接口清单 + 模块拆分 + 风险点),必须先读 PRD,六维度没问清楚不动笔 |
+| [code-refactor](code-refactor/) | 在保持行为不变前提下改进代码结构 / 可读性 / 效率,默认先列"重构清单 + 风险评估"等用户挑要做哪几条,再小步实施 + 每步验证 |
 
 ## 仓库结构
 
@@ -17,7 +18,9 @@
 ├── CLAUDE.md                       # 给 Claude Code session 的开发指引
 ├── prd-writer/
 │   └── SKILL.md                    # YAML frontmatter + 指令本体
-└── tech-design-writer/
+├── tech-design-writer/
+│   └── SKILL.md
+└── code-refactor/
     └── SKILL.md
 ```
 
@@ -58,6 +61,12 @@ python -m scripts.package_skill prd-writer/ <output-dir>
 - "帮我把这个 PRD 做个技术方案"
 - "F004 怎么实现"
 - "拆一下开发任务,我们 2 人 6 周做 MVP"
+
+**code-refactor**:
+- "帮我重构一下 UserService 这个文件"
+- "这段代码太乱,拆一下"
+- "扫一下 src/payment/ 下的代码异味"
+- "把 calcPrice 里的 O(n²) 优化掉"
 
 ## 新增 skill
 
