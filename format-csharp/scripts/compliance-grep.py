@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # Requires: Python 3.10+ (uses `list[X]` / PEP 604 unions in type hints)
 """
-C# style compliance grep audit. 11 rules (Cmd suffix / Attribute/Exception
+C# style compliance grep audit. 12 rules (Cmd suffix / Attribute/Exception
 suffix / I prefix / Chinese identifier / private field _ / anonymous delegate
-/ if-no-braces / float == / enum.ToString suspect / summary inline).
+/ if-no-braces / float == / enum.ToString suspect / summary inline /
+comment terminal period).
 Deterministic filters applied; `violations` is the actionable list.
-`enum_tostring_suspect` still needs LLM context-reading to confirm.
+`enum_tostring_suspect` and rare comment-shaped candidates inside multiline
+strings/comments still need LLM context-reading to confirm.
 
     python compliance-grep.py --scope path/to/src
     python compliance-grep.py --scope src --include-from changed.txt --jobs 4
@@ -101,10 +103,17 @@ RULES = [
     },
     {
         "key": "summary_inline",
-        "name": "<summary> 标签和内容写在同一行",
-        "rule_source": "方法注释规范 10: <summary>/</summary> 必须各占一行,内容夹中间独占一行",
-        "filter_hint": "无需过滤,命中即违规。少数情况下规范示例可能误中,LLM 读上下文跳过",
-        "pattern": r"(?:///\s*<summary>\s*\S|///\s*\S.*</summary>)",
+        "name": "<summary> 标签未独占行",
+        "rule_source": "方法注释规范 11: <summary>/</summary> 必须各占一行,内容夹中间独占一行",
+        "filter_hint": "候选限定为行首 /// 并排除 ////;打开上下文确认不在块注释/多行字符串内。真实文档注释只放行整行内容恰好为 <summary> 或 </summary>",
+        "pattern": r"^\s*///(?!/).*?</?summary(?=[\s/>]|$)",
+    },
+    {
+        "key": "comment_terminal_period",
+        "name": "注释内容以句号结尾",
+        "rule_source": "代码注释约定 3: 注释内容结尾省略中文句号和英文句号",
+        "filter_hint": "覆盖常见 //、///、行尾注释和块注释形态;英文省略号已过滤。打开上下文确认真实注释边界，并确认 ASCII 点不是缩写或字面数据的一部分",
+        "pattern": r"(?:^\s*\*|/\*|//).*?(?:。|\.)(?:\s*</[A-Za-z_][\w:.-]*\s*>)*\s*(?:\*/)?\s*$",
     },
 ]
 
@@ -114,7 +123,7 @@ RULES = [
 # violation (keep), False if it's a deterministic false-positive (drop).
 
 NO_FILTER_RULES = {"cmd_suffix", "chinese_identifier", "anonymous_delegate",
-                   "summary_inline", "enum_tostring_suspect"}
+                   "enum_tostring_suspect"}
 
 
 def _filter_attribute_no_suffix(text: str) -> bool:
@@ -172,6 +181,27 @@ def _filter_float_equality(text: str) -> bool:
     return True
 
 
+def _filter_summary_inline(text: str) -> bool:
+    """Keep summary-tag candidates unless the tag is the whole line payload."""
+    match = re.match(r"^\s*///(?!/)\s*(.*?)\s*$", text)
+    if match is None:
+        return False
+    return match.group(1) not in {"<summary>", "</summary>"}
+
+
+def _filter_comment_terminal_period(text: str) -> bool:
+    """Keep comment-shaped text ending in a period, excluding ellipses."""
+    payload = re.sub(r"\s*\*/\s*$", "", text).rstrip()
+    payload = re.sub(
+        r"(?:\s*</[A-Za-z_][\w:.-]*>)+\s*$",
+        "",
+        payload,
+    ).rstrip()
+    if payload.endswith("。"):
+        return True
+    return payload.endswith(".") and not payload.endswith("..")
+
+
 FILTERS = {
     "attribute_no_suffix":           _filter_attribute_no_suffix,
     "exception_no_suffix":           _filter_exception_no_suffix,
@@ -179,6 +209,8 @@ FILTERS = {
     "private_field_no_underscore":   _filter_private_field_no_underscore,
     "no_braces_on_control_flow":     _filter_no_braces_on_control_flow,
     "float_equality":                _filter_float_equality,
+    "summary_inline":                _filter_summary_inline,
+    "comment_terminal_period":       _filter_comment_terminal_period,
 }
 
 
@@ -370,8 +402,9 @@ def main() -> int:
         "generated_at_note": (
             "Run by compliance-grep.py. Deterministic filters already applied — "
             "`violations` is the LLM-actionable list. For `enum_tostring_suspect`, "
-            "LLM still needs to read each candidate to confirm left-side is enum "
-            "type (high false-positive rate)."
+            "LLM still needs to confirm the left-side type. For `summary_inline` "
+            "and `comment_terminal_period`, LLM confirms rare comment-shaped matches "
+            "are not inside multiline strings or block comments."
         ),
         "rules": results,
     }
@@ -392,8 +425,8 @@ def main() -> int:
                 extra = f" (was {r['candidate_count']} before filter)"
             print(f"  {r['name']:<40} {r['violation_count']:>5}{extra}")
         print()
-        print("Next: LLM reads the JSON, treats `violations` as the actionable list. "
-              "Only `enum_tostring_suspect` survivors need LLM context-reading.")
+        print("Next: LLM reads the JSON and confirms `enum_tostring_suspect` plus "
+              "rare comment-shaped string/block-comment lookalikes in context.")
 
     return 0
 

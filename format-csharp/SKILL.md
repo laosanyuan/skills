@@ -1,6 +1,6 @@
 ---
 name: format-csharp
-description: 保持 C# 代码可读性 + 风格统一 —— **不改运行行为,但改"代码长什么样"**:空白 / 缩进 / using 排序(dotnet format 机械流),加上命名(`UseCmd` → `UseCommand`、私有字段加 `_`、自定义 Attribute/Exception 后缀、英文标识符)、类内成员归类(字段 → 属性 → 构造 → 方法)、`#region` 分组、补 `<summary>` 注释、`enum.ToString()` → `[Description]+.GetDescription()`、匿名委托 → 具名方法、补 `if/for/while` 大括号、`string +=` → StringBuilder、浮点 `==` 加 epsilon 等(合规审计 + 按破坏性分批实施 语义流)。**两条腿走路 —— 用户讲 "format/格式化" 默认两个都跑**。**与 code-refactor 的边界:format-csharp 改 surface(代码长什么样),code-refactor 改 structure(代码怎么组织)** —— 改名/重排/补注释/换语法糖是 surface,提取方法/拆大类/优化算法是 structure。**严格护栏**:audit 完按 🟢 低 / 🟡 中 / 🔴 高 破坏性分批,每批 diff 预览 + 用户点头才动,改完跑 `dotnet build` 自检,失败立刻 revert 该批。**典型触发场景**:被 PR reviewer 批评、CI 因 `--verify-no-changes` 失败、新人没按规范提交、想统一一遍命名 / 加注释 / 重排成员、merge 后大量空白扰动。**具体用户原话**:"格式化下这个 csproj"、"整理一下这个 .cs"、"修一下缩进"、"按代码规范跑一遍"、"按规范审计一下"、"统一一下命名"、"把 Cmd 后缀都改成 Command"、"补一下缺失的 summary"、"重排一下类内成员顺序"、"按规范清理一下这个文件"、"format my C# project"、"clean up the C# code style"、"apply our coding conventions"。**不适用**:写新的 C# 代码 / 修 bug / 真重构(提取方法、拆大类、改算法、合并重复逻辑) → 转 code-refactor / 翻译 C# 到 F# 或 VB / 改 .editorconfig 或规范文档本身 / 处理非 .cs 文件(Razor / XAML / JSON / 配置)/ 配置 IDE 或 CI / 单纯解释 flag。
+description: 格式化、审计和整理现有 C# 代码，统一代码风格、命名、成员布局和注释。保持代码行为不变，不负责新增功能或结构性重构。
 ---
 
 # Format C# Code
@@ -11,6 +11,19 @@ description: 保持 C# 代码可读性 + 风格统一 —— **不改运行行�
 **阶段 B. 语义流(合规审计 + 按破坏性分批实施)** —— 命名、类内归类、`<summary>` 注释、写法禁令(`Cmd`→`Command`、`_` 前缀、`enum.ToString()` 等)。Section 6-8 走这条。
 
 **默认两条腿都跑**。除非用户明确说"只修空白"(只跑 A)、或"只审计先别动"(只跑 B,审计不实施)、或"只改命名"(只跑 B 但跳过 dotnet format)。
+
+**不可违反的注释输出约束:**
+
+1. **声明文档注释的内容只写“是什么 / 做什么”，不写“怎么做”**。本规则适用于类 / 接口、方法 / 函数和属性的 `<summary>`；默认跳过的遗留模块头模板不在此列。内容必须与声明保持同一抽象层级：类 / 接口概括核心职责，方法 / 函数概括目的或结果，属性概括所表示的值或状态。默认使用一个简短内容行；名称已经清楚时，直接写对应的简短中文短语即可，不得为了显得“有信息量”而补充内部步骤、协作者、调用顺序、订阅方式、后台 / 线程策略、回滚恢复过程或资源释放细节。只改变内部实现而职责不变时，`<summary>` 应仍然成立。必要且不显然的实现原因、流程或关键步骤放在对应代码逻辑前的普通行注释；调用者需要知道的外部契约按性质写入 `<param>`、`<returns>`、`<exception>` 或 `<remarks>`。
+2. **标签必须物理换行**。无论是新增、改写还是整理现有注释，`<summary>` 和 `</summary>` 都必须各自占一个 `///` 行，内容放在中间的一个或多个 `///` 行。即使内容只有一句，也禁止输出 `/// <summary>内容</summary>`。
+3. **注释内容结尾省略句号**。所有新增或改写的 C# 注释都不得以中文句号 `。` 或英文句号 `.` 结束，包括 XML 文档注释内容、普通 `//` 行注释和块注释；内联 XML 标签中，结束标签前的内容末尾也按此规则处理。只省略作为句末标点的句号，版本号 `1.2`、小数 `0.5`、URL、文件名或成员名内部的点保持不变；省略号 `...` / `……` 不属于本规则所说的句号。
+
+```csharp
+/// <summary>
+/// 开启服务
+/// </summary>
+public static void StartServices()
+```
 
 **环境前提**:
 - **Python 3.10+**(脚本用了 `list[X]` / `X | None` 等 PEP 604 类型注解)
@@ -30,7 +43,7 @@ description: 保持 C# 代码可读性 + 风格统一 —— **不改运行行�
 阶段 B: 合规审计 + 实施 语义流(Section 6-8)
    6. compliance-grep.py 抓违规 → 真违规清单
    7. 按 🟢 低 / 🟡 中 / 🔴 高 破坏性分批 → diff 预览 → 用户挑批 → 实施 → dotnet build 验证(失败 revert)
-   8. 终极汇总(A + B 改了什么)
+   8. 若实施过修改:复查本次 `<summary>` 布局与内容以及注释结尾 → 终极汇总(A + B 改了什么)
 ```
 
 **section 2(dry-run)、section 7(每批先预览)绝对不能跳到直接动手** —— 改文件出问题没退路,**预览+用户点头是兜底**。
@@ -217,9 +230,9 @@ echo "exit=$?"
 
 **两个脚本并行跑**(各管一摊):
 ```bash
-# 1. 11 条 grep 规则(命名 / 中文标识符 / 写法禁令 / summary 单行 等)
+# 1. 12 条 grep 规则(命名 / 中文标识符 / 写法禁令 / summary 单行 / 注释句号结尾 等)
 python ~/.claude/skills/format-csharp/scripts/compliance-grep.py --scope path/to/src
-# 输出 $TEMP\compliance-audit.json,violations 已过滤(只 enum_tostring 还需 LLM 读上下文)
+# 输出 $TEMP\compliance-audit.json；enum_tostring 和两个注释候选仍需 LLM 读上下文
 
 # 2. 4 条 class body 解析规则(成员顺序 / region 缺失 / region 间空行 / 成员间空行)
 python ~/.claude/skills/format-csharp/scripts/class-layout-check.py --scope path/to/src
@@ -232,7 +245,7 @@ python ~/.claude/skills/format-csharp/scripts/class-layout-check.py --scope path
 
 | 档 | 判据 | 典型规则 |
 |---|---|---|
-| 🟢 低 | 改动只影响声明本身 / 同 class 内部 / 单 method 内 | 私有字段加 `_`、`if/for/while` 加 `{ }`、加 `<summary>`、`<summary>` 单行→多行、浮点 `==` 改 epsilon、`string +=` 改 StringBuilder、类内重排/补 region |
+| 🟢 低 | 改动只影响声明本身 / 同 class 内部 / 单 method 内 | 私有字段加 `_`、`if/for/while` 加 `{ }`、加 `<summary>`、`<summary>` 单行→多行、注释结尾去句号、浮点 `==` 改 epsilon、`string +=` 改 StringBuilder、类内重排/补 region |
 | 🟡 中 | 同工程内多处源码引用(可 Grep 验证),含 XAML/.razor binding | ICommand `Cmd` → `Command`(必查 XAML)、自定义 Attribute/Exception 改名、`enum.ToString()` → `[Description]`、匿名 delegate → 具名方法 |
 | 🔴 高 | 外部 API / 字符串-based 引用 / 跨工程 / 语义判断 | public class/interface/enum 改名、中文标识符→英文(需用户拍板目标命名)、测试方法改名 |
 
@@ -246,7 +259,7 @@ Grep("中文名"   in *.cs *.xaml *.json *.resx)         # 中文 identifier 全
 **audit 报告格式** —— 完整 mock 范例在 [`references/compliance-check.md`](./references/compliance-check.md) Section 5。骨架:总览 (🟢/🟡/🔴/ℹ️ 计数) → 按破坏性分级的详单(每条违规给 file:line + 改法 + 引用扫描结果) → 规则冲突单独列。
 
 **关键原则:**
-- **Grep 命中要开文件确认** —— 脚本已用确定性 filter 砍掉绝大多数误判,但 `enum.ToString()` 这种**必须 LLM 读上下文判断左侧类型**,不能盲信。
+- **Grep 命中要开文件确认** —— 脚本已用确定性 filter 砍掉绝大多数误判,但 `enum.ToString()` 必须读上下文判断左侧类型；`summary_inline` 和 `comment_terminal_period` 也要排除块注释 / 多行字符串内的同形文字，并确认英文点号确实是句末标点，不能盲信。
 - **规则冲突单独列**,不混在违规里 —— 这是用户决策项,不是 fix 项
 - **不要修改 `references/代码规范.md`** —— 即使发现规范有自相矛盾,在报告"规则冲突"那一节指出,不替用户改
 
@@ -289,8 +302,17 @@ audit 完直接进 Section 7。**核心节奏:每批先 diff 预览 → 用户�
 每条规则具体改法(grep 哪些引用、补哪些 using、何时反问用户) → 见 [`references/compliance-check.md`](./references/compliance-check.md) Section 7。关键点 highlight:
 - **改名**:`Edit` 改声明 → grep 引用 → `Edit` 同步;XAML/.razor binding 同改
 - **enum.ToString() → `.GetDescription()`**:**先 grep `GetDescription()` 已有否**,没有**反问用户**在哪建,不默认新建文件
-- **加 `<summary>`**:写不出有信息量的标"建议手工补",**不凑数写废话**
+- **加 / 改 `<summary>`**:默认用一个简短内容行，只概括声明“是什么 / 做什么”；清楚名称的直接中文表达（如 `StartServices` → “开启服务”）就是合格注释，不为追求“有信息量”扩写内部步骤。写不出准确职责时标“建议手工补”，不凑数写“处理相关逻辑”等废话。凡是新增或修改的 `<summary>` 都立即按文首的硬性布局规则写成多行，内容结尾不加句号，不先产生违规形式再留给后续修理
 - **类内布局**(顺序/region/间隔):跑 `class-layout-check.py` 拿 findings,**重排是文件内部的大改动**,用 Edit 重写整段类体 + dotnet build 验证(改动不跨文件,build 通过基本就 OK)。**audit findings 是必要不充分条件** —— audit 报的肯定要改,**但 audit 没报的不代表合规**。脚本基于正则启发式分类,可能漏算 `[DllImport] extern` 方法 / 多行 attribute decoration / nested 类内 lambda 等,导致某 group 实际有 N 个成员但 audit 只算到 N-1 个。**每个修类的 LLM 任务,改完 audit findings 后必须打开 JSON 里的 `class_layouts` 看该 class 的 group 全景**(每个非空 group 的 count / in_region / status),跟实际文件里成员数对一下,发现差异就是 parser miss,主动补 region —— 不要"audit 没标就跳过"
+
+**凡本次实施过 C# 文件修改，最终交付前必须做 `<summary>` 布局与内容以及注释结尾复查**。默认范围限定为本次新增或改写的注释；若用户要求全量注释合规审计，才检查目标范围内的全部注释:
+
+```bash
+git diff --unified=20 -- '*.cs'
+python ~/.claude/skills/format-csharp/scripts/compliance-grep.py --scope <scope> --include-from <changed-cs-files.txt> --quiet
+```
+
+单文件可直接把该 `.cs` 文件作为 `--scope`，省略 `--include-from`。脚本辅助检查 `<summary>` 布局，以及常见的独占行 / 行尾 `//`、`///`、块注释和 XML 结束标签前的句号，**不能判断内容是否过度，也不能完整理解 C# 注释边界或点号语义**。必须逐条打开 diff 中新增或改写的 `<summary>`、其所属声明以及必要的实现上下文，确认它只概括职责 / 目的 / 所表示的值，并通过“内部实现变化而职责不变时仍然成立”的测试；实现步骤只在必要且不显然时留在对应逻辑附近。再检查全部新增或改写的注释结尾，确认未使用句号；版本号、小数、URL 等内部点号不动。最后打开脚本报出的 `summary_inline` 和 `comment_terminal_period` 候选上下文，排除块注释或多行字符串里的同形文字，并确认英文点号不是缩写或字面数据的一部分。默认两条腿流程或本次包含注释合规时，**内容、布局和结尾真违规都必须为 `0` 才能交付**。如果用户明确只做阶段 A 或排除注释变更，不扩大范围清理历史注释；但必须确保本次 diff 没有新增或改坏注释，并单独报告存量候选。
 
 ## 8. 全流程终极汇总
 
@@ -300,6 +322,7 @@ audit 完直接进 Section 7。**核心节奏:每批先 diff 预览 → 用户�
 - 阶段 A 改了 N 个文件,主要修了什么
 - 阶段 B 改了 M 个文件 × P 处违规,按 🟢/🟡/🔴 分类计数
 - 跳过未改:列出原因(规则冲突 / 模块头默认 skip 等)
+- `<summary>` 布局与内容、注释结尾复查结果(实施过 C# 修改时)
 - dotnet build / dotnet test 结果
 - 下一步:建议用户怎么 commit(拆 2-3 个 commit 方便 review)
 
@@ -335,7 +358,7 @@ audit 完直接进 Section 7。**核心节奏:每批先 diff 预览 → 用户�
 
 **阶段 A**:不要不 dry-run 直接改 / 不要静默加 `--include-generated` / 不要顺手改 .editorconfig / 不要把 `--severity` 提到 `error`。
 
-**阶段 B**:不要按 audit 报告"擅自决定"中文 → 英文的目标命名(必须让用户拍板)/ 不要为了凑数写废话 `<summary>`(写不出有信息量的就标"建议手工补")/ 不要修改 `references/代码规范.md`(除非用户明说加规则)。
+**阶段 B**:不要按 audit 报告"擅自决定"中文 → 英文的目标命名(必须让用户拍板)/ 不要为了凑数写废话或过度展开的 `<summary>`(写不出准确职责就标"建议手工补")/ 不要修改 `references/代码规范.md`(除非用户明说加规则)。
 
 **通用边界**:
 - **拆方法 / 优化算法 / 合并重复逻辑 / 提取类 → 转 code-refactor**。format-csharp 只改 surface,不改 structure。详见 Section 0。

@@ -58,8 +58,13 @@
 ```bash
 python ~/.claude/skills/format-csharp/scripts/compliance-grep.py --scope <目录|.csproj|.sln|.cs>
 # 默认输出 $TEMP/compliance-audit.json
-# 里面是 11 条规则的 violations(已应用确定性过滤)+ 每条的 filter_hint
+# 里面是 12 条规则的 violations(已应用确定性过滤)+ 每条的 filter_hint
+
+# 实施过修改时的交付复查:只查本次触及的 .cs,再打开注释相关候选确认上下文
+python ~/.claude/skills/format-csharp/scripts/compliance-grep.py --scope <scope> --include-from <changed-cs-files.txt> --quiet
 ```
+
+默认两条腿流程或本次包含注释合规时，真实 `summary_inline` 和 `comment_terminal_period` 违规必须清零。脚本只辅助检查标签布局与常见注释形态，不能替代 Section 4 的内容语义检查，也不能完整理解 C# 注释边界或英文点号语义；交付前还要逐条阅读本次新增或改写的注释。用户若明确只做阶段 A/排除注释变更，只确保本次 diff 没有新增或改坏注释，存量候选单独报告、不擅自扩大修改范围。
 
 JSON 结构:
 ```json
@@ -81,9 +86,9 @@ JSON 结构:
 }
 ```
 
-**LLM 拿到 JSON 后干啥:** 对每条规则 (1) 读 `filter_hint` 知道哪些是误判要丢、(2) 应用过滤、(3) 对剩下的"真违规"必要时开文件读上下文确认(尤其是 `enum.ToString()` 这种高误判规则)、(4) 写最终审计报告(按 Section 5 格式)。
+**LLM 拿到 JSON 后干啥:** 对每条规则 (1) 读 `filter_hint` 知道哪些是误判要丢、(2) 应用过滤、(3) 对剩下的"真违规"必要时开文件读上下文确认(尤其是 `enum.ToString()` 以及可能位于块注释/多行字符串内的注释形状候选)、(4) 写最终审计报告(按 Section 5 格式)。
 
-**脚本里覆盖的 10 条规则**(模式和 filter_hint 的权威定义在 `scripts/compliance-grep.py` 的 `$rules` 数组里。要看具体某条规则的 regex 或 filter 文案,直接 Read 那个脚本):
+**脚本里覆盖的 12 条规则**(模式和 filter_hint 的权威定义在 `scripts/compliance-grep.py` 的 `RULES` 数组里。要看具体某条规则的 regex 或 filter 文案,直接 Read 那个脚本):
 
 | key | 名称 | 命中即违规? |
 |---|---|---|
@@ -97,7 +102,12 @@ JSON 结构:
 | `no_braces_on_control_flow` | if/for/while 单语句不加 `{ }` | 需过滤(误中 inline return/throw) |
 | `float_equality` | 浮点 `==` / `!=` 直接比较 | 需过滤(== null 合法) |
 | `enum_tostring_suspect` | `enum.ToString()` 嫌疑(误判极多) | **必须读上下文**判断左侧类型 |
-| `summary_inline` | `<summary>` 标签和内容写在同一行 | ✅ 是 (规范要求标签独占一行,内容夹在中间) |
+| `summary_inline` | `<summary>` / `</summary>` 未独占行 | 需打开上下文排除块注释/多行字符串；真实文档注释命中即违规 |
+| `comment_terminal_period` | 注释内容以句号结尾候选 | 必须读上下文确认注释边界及英文点号语义；真实句末句号才是违规 |
+
+`summary_inline` 的正则已限定为行首 `///` 并排除 `////`，不会误中普通单行注释或单行字符串。但纯 grep 不理解 C# 词法状态：块注释、逐字字符串或 raw string 内若恰好有同样的行首文字，仍会成为候选。打开命中位置确认即可，不要为此自制不完整的 C# 词法器；若未来需要机器强制，应改用 Roslyn syntax trivia。
+
+`comment_terminal_period` 检查常见的独占行 / 行尾 `//`、`///`、`/* ... */`、块注释星号行，以及句号后紧跟 XML 结束标签的情况；英文省略号 `...` 会过滤。没有注释标记的块注释正文行仍可能漏检，必须由最终 diff 复查。版本号、小数、IP、URL、路径、文件名、类型名或缩写中的点不是句末句号。候选必须打开上下文，排除多行字符串中的同形文字，并确认 ASCII `.` 的语义。
 
 **Backing field 豁免**:`private int _no;` 这种属性的 backing field 如果放在 `[Properties]` region 内(紧贴它的属性),脚本会自动识别为 backing field,**不算 `[Private Fields]` 的成员、不破坏顺序、和属性之间不强制空行**。规则详见 `代码规范.md` "代码布局"章节。脚本**不主动检查** "`_no` 应该挪到 [Properties]" —— 在 `[Private Fields]` 里的 `_xxx` 字段位置是合法的,只是规范**推荐**把它放属性旁边。LLM 别擅自给用户报这种"未触发的建议"。
 
@@ -153,6 +163,7 @@ dpn=DockPanel  ckl=CheckedListBox
 |---|---|---|
 | 方法名是不是动宾短语 | 良好习惯表(`方法的命名,一般将其命名为动宾短语,如 ShowDialog/CreateFile`) | 列项目所有 `public/internal` method 签名,过滤 `Is*/Has*/Can*/Should*`(谓语 OK)、`To*/From*`(转换 OK)、`Get*/Set*/Update*/Create*/Delete*` 这类常见动词 OK。**剩下纯名词命名的方法**(如 `User()`、`Order()`、`Customer()`)就是不合规 |
 | ~~`<summary>` 注释覆盖率~~ | ~~方法注释规范 1+3~~ | **✅ 已脚本化** —— 见 `class-layout-check.py` 的 `summary_missing_on_public` 子规则(自动检查 public 类/方法/属性/事件,跳过 attribute decoration) |
+| `<summary>` 内容是否只写“是什么 / 做什么” | 代码注释约定 1 + 方法注释规范 10 | 逐条读取 `<summary>`、所属声明和必要的实现上下文。类 / 接口应概括核心职责，方法 / 函数应概括目的或结果，属性应概括值或状态；默认一个简短内容行。用“只改变内部调用、顺序或线程策略而职责不变时，注释是否仍成立”判断是否混入实现细节。该规则不能靠长度或关键词正则判定；默认跳过的遗留模块头模板不在检查范围内 |
 | 模块头注释(功能/作者/日期) | 模块头部注释规范 | 读 .cs 文件头 15 行,看有没有规范要求的 `/// <summary>` 模板字段(功能/完成日期/作者)。**⚠️ 默认跳过这条** —— 这是 .NET Framework 时代的遗留规范,现代 C# 项目(尤其用 file-scoped namespace 之后)几乎从不写模块头注释,跑全量审计大概率每个文件都报、刷屏。**只在用户明确说"按模块头规范查一下"时才跑**,平时静默 |
 | 类内成员顺序 | 代码布局 1(`类内部的代码布局顺序:数据成员、属性、构造函数(、事件)、方法`) | 读类体,按出现顺序提取每个成员的 kind(field / property / ctor / event / method),看是否符合顺序 |
 | 局部变量名意义 | 良好习惯表(`局部变量的名称要有意义。不要用 x,y,z 等等(除用于 For 循环变量中可使用 i,j,k,l,m,n)`) | 读 `var x = ` / `int tmp = ` / `string s = ` 等声明,判断是不是 `x/y/z/tmp/s/a/b/c/data/foo/bar` 这类无意义名;`for` 循环里的 `i/j/k/l/m/n` 允许 |
@@ -241,7 +252,7 @@ audit 完不是终点,是**通向"按破坏性分批实施"的输入**。报告�
 
 ## 6. 不该做的事
 
-- **不要把 Grep 命中直接当违规** —— 必须开文件确认上下文。`\.ToString\(\)` 经常误中 `int.ToString()` 等合法用法。误判一次消耗一次信任。脚本已经把确定性误判过滤掉,但 `enum_tostring_suspect` 这种**必须 LLM 读上下文**。
+- **不要把 Grep 命中直接当违规** —— 必须开文件确认上下文。`\.ToString\(\)` 经常误中 `int.ToString()` 等合法用法；行首注释形状的文字也可能位于块注释或多行字符串内。脚本已过滤确定性误判，但 `enum_tostring_suspect`、`summary_inline` 和 `comment_terminal_period` 的这类候选**必须 LLM 读上下文**。
 - **不要为了刷违规数把同一规则在同一文件里拆成几十条** —— 合并展示。
 - **不要修改 `代码规范.md` 这份内嵌文档** —— 即使发现规范有自相矛盾、有打字错、有过时信息,在报告"规则冲突"那一节**指出**,但**不替用户改**。规范变动是用户决策。如果用户明确说"改一下规范文档加一条新规则"那是另一种意图,可以改,但要先确认。
 - **不要试图替 LLM 跑 Roslyn 分析器** —— StyleCop / SonarAnalyzer / 自定义 analyzer 这些属于 `dotnet format analyzers` 子命令范畴。本文是这些 analyzer 之外、需要 LLM 语义判断或字符串模式匹配的部分。
@@ -317,9 +328,11 @@ audit 完不是终点,是**通向"按破坏性分批实施"的输入**。报告�
 ### 注释类
 
 - **加 `<summary>` 注释**:
-  - LLM 按方法/类的语义自己写一两行中文 summary(参照 `代码规范.md` 注释规范的 4-6 条)
-  - **不能为了凑数写废话** —— "Method to do something" 比没注释更恶心
-  - 写不出有信息量的就在报告里标"建议手工补",不动手
+  - 默认只写一个简短中文内容行，并与声明保持同一抽象层级：类 / 接口概括核心职责，方法 / 函数概括目的或结果，属性概括值或状态；默认跳过的遗留模块头模板不在此列
+  - 名称已清楚时直接翻成简短中文短语即可，例如 `StartServices` → “开启服务”、`InitializeAsync` → “异步初始化”、`ClearServices` → “清理服务”、`InitializationTask` → “初始化任务”；不要为了显得“有信息量”而扩写内部步骤
+  - 不在 `<summary>` 中枚举协作者、调用顺序、订阅方式、后台 / 线程策略、回滚恢复过程或资源释放细节。必要且不显然的实现说明放在对应逻辑附近；参数、返回值、异常和补充契约分别使用 `<param>`、`<returns>`、`<exception>`、`<remarks>`
+  - 用“内部实现变化而职责不变时，注释是否仍然成立”做复查。写不出准确职责时就在报告里标“建议手工补”，不凑数写“处理相关逻辑”等废话
+  - 所有新增或改写的注释内容结尾省略中文句号 `。` 和英文句号 `.`；内联 XML 标签在结束标签前去掉句号，版本号、小数、URL 等内部点号保持不变
 
 - **`<summary>` 单行 → 多行**(`summary_inline`):
   把 `/// <summary>内容</summary>` 拆成三行:
@@ -331,7 +344,13 @@ audit 完不是终点,是**通向"按破坏性分批实施"的输入**。报告�
   /// 处理订单付款
   /// </summary>
   ```
-  **保留原文不动,只调布局**。其他 XML 文档标签(`<param>` / `<returns>` 等)单行允许,只 `<summary>` 必须多行
+  纯布局批次**保留原文不动，只调布局**；若原文还违反“只写做什么”规则，把它作为单独的 reading-required 内容问题列入预览，不在未获确认时顺手改写。其他 XML 文档标签(`<param>` / `<returns>` 等)单行允许,只 `<summary>` 必须多行。新增或改写 `<summary>` 时也直接使用多行布局，不得先产生单行形式。
+
+- **注释句号结尾 → 省略句号**(`comment_terminal_period`):
+  - `/// 开启服务。` → `/// 开启服务`
+  - `/// <param name="bootstrap">设备引导程序.</param>` → `/// <param name="bootstrap">设备引导程序</param>`
+  - `// 回滚目录切换。` → `// 回滚目录切换`
+  - 只删除作为句末标点的句号，不删除 `1.2`、`0.5`、IP、URL、路径、文件名、成员名、缩写或省略号中的点；脚本遗漏的块注释正文行要在 diff 中人工检查
 
 ### 类内归类
 
@@ -400,6 +419,7 @@ audit 完不是终点,是**通向"按破坏性分批实施"的输入**。报告�
   - 模块头注释规则 (默认 skip,现代项目不需要)
   - 规则冲突 1 处 (规范说 Tab,.editorconfig 说 space —— 待你拍板)
 
+summary 布局与内容、注释结尾复查: ✅ 已确认无真违规
 dotnet build: ✅ 通过
 单元测试: ✅ 通过 (跑了 137 个测试,全过)
 
