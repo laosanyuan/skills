@@ -1,6 +1,6 @@
 # skills
 
-四个可独立安装的个人技能，支持从当前技能目录定位自己的参考文件和脚本，不依赖相邻技能包才能工作。
+五个可独立安装的个人技能，支持从当前技能目录定位自己的参考文件和脚本，不依赖相邻技能包才能工作。
 
 ## 技能
 
@@ -10,6 +10,7 @@
 | [tech-design-writer](tech-design-writer/SKILL.md) | 从需求生成技术设计；附草稿结构、编号与显式需求引用检查，不代替语义评审 |
 | [code-refactor](code-refactor/SKILL.md) | 行为保持的重构、性能优化和只读异味检查；附行为测试有效性、反证与验证声明核对 |
 | [format-csharp](format-csharp/SKILL.md) | C# 格式、命名、布局和注释整理；附可选 Roslyn 注释检查、文档 URL 保留候选检查与验证执行器 |
+| [review-csharp](review-csharp/SKILL.md) | C#、XAML 与关联配置评审；检查功能、生命周期、设计/复制代码和本机调试残留，基于证据只读报告 |
 
 共同原则：明确的局部修改直接完成；开放的大改先讨论取舍；只读请求不修改；保留用户已有工作。description 保持一两句，详细流程写在正文。
 
@@ -44,6 +45,13 @@ format-csharp/
   scripts/comment-syntax.py
   scripts/comment-syntax/Program.cs
   scripts/comment-syntax/CommentSyntax.csproj
+review-csharp/
+  SKILL.md
+  references/correctness-checklist.md
+  references/xaml-review.md
+  references/delivery-check.md
+  references/compliance-check.md
+  references/代码规范.md
 ```
 
 辅助脚本使用 Python 3.10+ 标准库。C# 机械格式化另需与项目兼容的 .NET SDK/MSBuild 环境；没有工具时可进行限定范围的人工检查，并明确验证限制。检查器不代替业务、C# 语义或技术设计的人工判断。
@@ -51,6 +59,10 @@ format-csharp/
 可选 Roslyn 注释检查需要已安装稳定版 .NET SDK 8+，直接使用 SDK 自带程序集，在显式产物目录离线构建自带工具，不执行受审项目。它提高真实注释/XML 标签定位精度但有构建开销，仅覆盖两条注释规则；保留原正则路径，具体盲点和失败状态见包内参考。
 
 `format-csharp` 携带自包含的验证执行器及说明；`code-refactor` 沿用项目验证命令，并在自建测试时核对装置有效性。执行器不提供系统沙箱，也不扩大命令、网络或写入授权；退出成功不证明测试覆盖充分。
+
+`review-csharp` 不附带自动修复或“自动判定所有 bug”的脚本。它携带与 `format-csharp/references/代码规范.md` 字节一致的规范副本，单独安装也能评审；有可用 format-csharp 时才按需使用其只读检查工具。综合评审也追踪重复订阅、退出清理、内存保留链和结构耦合，区分功能/生命周期缺陷、设计/可维护性风险与格式问题，不只检查能否编译或代码外观。
+
+XAML 按实际框架联查绑定来源、code-behind、ViewModel 和资源，不套用 C# 格式规则。同职责的大段手写复制应给出复用边界；个人本机调试残留不能仅靠 `#if DEBUG` 获得主干豁免。确认问题须复核反证，缺少关键上下文单列待确认项，不承诺绝对无误报或用静态阅读冒充运行验证。
 
 ## 安装
 
@@ -78,6 +90,7 @@ Copy-Item -Path "$skillSource\*" -Destination $skillDestination -Recurse -Force
 - “按这份需求做技术方案，选型由你推荐”“两人六周怎么拆任务”
 - “把这个内部函数改名并同步引用”“只扫描这里的代码异味，不改”
 - “只格式化这个 C# 文件的空白”“按规范整理这些类的注释”
+- “review 这次 C# 改动，只报告新增问题”“检查这个类的异步和资源生命周期，不修改代码”
 
 C# 注释默认要求：summary 简短描述职责，开始/结束标签各占一行，注释结尾省略句号；实现细节只在必要的代码逻辑附近说明。
 
