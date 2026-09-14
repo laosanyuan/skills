@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 # Requires: Python 3.10+ (uses `list[X]` / PEP 604 unions in type hints)
 """
-C# class-body layout audit. 5 sub-rules: members_out_of_order / region_missing
-/ region_no_blank_between / members_no_blank_line / summary_missing_on_public.
-Regex state-machine, not full AST — misses nested/partial classes, multi-line
-attribute decorations, multi-line expression bodies (LLM should spot-check).
+C# class-body layout and summary candidates, not verified violations.
+Heuristic parser: braces in strings/comments, complex declarations, nested types,
+partial aggregation and preprocessor branches require manual review.
 
     python class-layout-check.py --scope path/to/src
     python class-layout-check.py --scope path/to/src --include-from changed.txt --jobs 4
 """
 
 import argparse
-import json
-import os
 import re
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from scan_scope import add_scan_arguments, read_source, resolve_cs_files, write_report
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -31,30 +30,28 @@ CANONICAL_ORDER = [
     "PrivateFields",    # 1. 私有字段 (含 const / static readonly)
     "Properties",       # 2. 属性
     "Events",           # 3. 事件
-    "Commands",         # 4. 命令 ([RelayCommand] methods / ICommand properties)
-    "Constructors",     # 5. 构造函数
-    "PublicMethods",    # 6. 公有方法
-    "PrivateMethods",   # 7. 私有方法
+    "Constructors",     # 4. 构造函数
+    "PublicMethods",    # 5. 公有方法
+    "PrivateMethods",   # 6. 私有方法
 ]
 
 CANONICAL_REGION_NAME = {
     "PrivateFields":  "[Private Fields]",
     "Properties":     "[Properties]",
     "Events":         "[Events]",
-    "Commands":       "[Commands]",
     "Constructors":   "[Constructors]",
     "PublicMethods":  "[Public Methods]",
     "PrivateMethods": "[Private Methods]",
 }
 
-SPACE_REQUIRED_KINDS = {"Properties", "Commands", "PublicMethods", "PrivateMethods", "Events"}
+SPACE_REQUIRED_KINDS = {"Properties", "PublicMethods", "PrivateMethods"}
 
 
 # -- Member kind classification (heuristic, line-level) ----------------------
 
 # Strip leading attributes like [Obsolete] so they don't confuse classification.
 _ATTR_PREFIX = re.compile(r"^\s*(\[[^\]]+\]\s*)+")
-_MEMBER_MODIFIERS = "public|private|protected|internal|static|virtual|override|new|abstract|sealed|readonly|partial|async|extern|unsafe|volatile"
+_MEMBER_MODIFIERS = "public|private|protected|internal|static|virtual|override|new|abstract|sealed|readonly|partial|async|extern|unsafe|volatile|const|required|file"
 
 
 def classify_member(line: str, class_name: str) -> str | None:
@@ -87,13 +84,10 @@ def classify_member(line: str, class_name: str) -> str | None:
 
     # Property / Method / Field — strip leading modifiers, then disambiguate
     # by matching `TYPE NAME (body)` with lazy TYPE.
-    # MUST have at least one modifier (public/private/etc) — bare lines without
-    # modifiers are continuations (e.g. `.Cast<X>()` chained call), NOT new
-    # declarations.
+    # Modifiers may be omitted (implicit private class members and interface
+    # declarations); parse_file limits classification to class-body depth.
     has_modifier = re.match(rf"^\s*(?:(?:{_MEMBER_MODIFIERS})\s+)+", stripped)
-    if not has_modifier:
-        return None
-    after_modifiers = stripped[has_modifier.end():]
+    after_modifiers = stripped[has_modifier.end():] if has_modifier else stripped
     if not after_modifiers:
         return None
 
@@ -120,9 +114,6 @@ def classify_member(line: str, class_name: str) -> str | None:
     # body in ("=", ";") → field declaration
     return "PrivateFields"
 
-    return None
-
-
 # -- Data structures ---------------------------------------------------------
 
 @dataclass
@@ -138,6 +129,7 @@ class Member:
     kind: str
     region: str | None
     text: str
+    end_line: int = 0
 
 
 @dataclass
@@ -158,33 +150,6 @@ _CLASS_DECL = re.compile(
 )
 
 
-def _has_relay_command_attr(lines: list[str], decl_line_idx: int) -> bool:
-    """Walk up to 5 non-blank lines above to check for [RelayCommand]."""
-    steps = 0
-    for j in range(decl_line_idx - 1, -1, -1):
-        text = lines[j].strip()
-        if not text:
-            continue
-        steps += 1
-        if steps > 5:
-            return False
-        if text.startswith("[RelayCommand"):
-            return True
-        if text.startswith("[") and text.endswith("]"):
-            continue  # other attribute, keep looking
-        return False
-    return False
-
-
-_COMMAND_TYPE_RE = re.compile(
-    r"\b(I?Async)?(I?RelayCommand|ICommand)\b"
-)
-
-
-def _looks_like_command_property(line: str) -> bool:
-    """Property whose type is ICommand / IRelayCommand / RelayCommand / AsyncRelayCommand."""
-    return bool(_COMMAND_TYPE_RE.search(line))
-
 # Multi-line block property head: `public int Name` with nothing after the name —
 # no `(` (would be method), no `{` / `=>` / `;` (would be auto-prop / expr-bodied /
 # field). Next non-blank line is expected to be `{` (the property body opener).
@@ -193,11 +158,9 @@ _MULTILINE_PROP_HEAD = re.compile(
 )
 
 
-def parse_file(path: Path) -> list[ClassRecord]:
-    try:
-        lines = path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
-    except OSError:
-        return []
+def parse_file(path: Path, lines: list[str] | None = None) -> list[ClassRecord]:
+    if lines is None:
+        lines = read_source(path).splitlines()
 
     classes: list[ClassRecord] = []
     current: ClassRecord | None = None
@@ -209,6 +172,7 @@ def parse_file(path: Path) -> list[ClassRecord]:
     paren_depth = 0  # track `(` / `)` to skip multi-line method signature continuations
     in_class_depth = -1  # depth at which class body opened
     current_region: str | None = None
+    region_stack: list[RegionBlock] = []
     # True when we're inside an expression-bodied member that spans multiple
     # lines (e.g. `public bool Equals(...) =>\n    other is not null && ...;`).
     # Lines while True are body continuations — DON'T classify them.
@@ -251,13 +215,16 @@ def parse_file(path: Path) -> list[ClassRecord]:
         # #region / #endregion tracking (only inside current class)
         if current:
             if m := re.match(r"^\s*#region\s*(.*)$", line):
-                name = m.group(1).strip()
-                current.region_blocks.append(RegionBlock(name=name, start_line=lineno))
-                current_region = name
-            elif re.match(r"^\s*#endregion", line):
-                if current.region_blocks and current.region_blocks[-1].end_line == 0:
-                    current.region_blocks[-1].end_line = lineno
-                current_region = None
+                block = RegionBlock(name=m.group(1).strip(), start_line=lineno)
+                current.region_blocks.append(block)
+                region_stack.append(block)
+            elif re.match(r"^\s*#endregion", line) and region_stack:
+                region_stack.pop().end_line = lineno
+            current_region = next(
+                (block.name for block in reversed(region_stack)
+                 if block.name in CANONICAL_REGION_NAME.values()),
+                region_stack[-1].name if region_stack else None,
+            )
 
             # Classify member — only at class body TOP LEVEL (one depth deeper
             # than the class declaration), NOT inside method/property bodies,
@@ -283,15 +250,6 @@ def parse_file(path: Path) -> list[ClassRecord]:
                                 kind = "Properties"
                             break
                 if kind and kind != "directive":
-                    # Reclassify as Commands if decorated with [RelayCommand] —
-                    # CommunityToolkit.Mvvm generates an ICommand named
-                    # XxxCommand for partial methods so marked. Also catches
-                    # Property whose type/name indicates ICommand.
-                    if kind in ("PrivateMethods", "PublicMethods", "Properties"):
-                        if _has_relay_command_attr(lines, i):
-                            kind = "Commands"
-                        elif kind == "Properties" and _looks_like_command_property(line):
-                            kind = "Commands"
                     current.members.append(Member(
                         line=lineno,
                         kind=kind,
@@ -320,511 +278,213 @@ def parse_file(path: Path) -> list[ClassRecord]:
         # Track brace depth (after member classification, so depth at class-open
         # line is still in_class_depth)
         brace_depth += opens - closes
+        if (current and current.members and paren_depth == 0
+                and brace_depth == in_class_depth + 1
+                and re.search(r"(?:;|})\s*(?://.*)?$", line)):
+            current.members[-1].end_line = lineno
 
         # End of class body
-        if current and brace_depth <= in_class_depth and closes > opens:
+        if current and brace_depth <= in_class_depth and closes > 0:
             current.end_line = lineno
             classes.append(current)
             current = None
             in_class_depth = -1
             current_region = None
+            region_stack.clear()
 
     return classes
 
 
-# -- Backing field detection -------------------------------------------------
-# A "backing field" is a PrivateFields member that's either:
-#   (a) decorated with [ObservableProperty] attribute (CommunityToolkit.Mvvm) —
-#       source generator emits a partial property `PascalName` for it
-#   (b) positionally placed inside the [Properties] region, OR
-#   (c) named `_camelCase` and immediately followed by a property whose name
-#       is the PascalCase version (fallback for plain manual backing fields)
-#
-# Backing fields are RECLASSIFIED into the Properties group (per user direction —
-# they ARE properties semantically, just declared as fields):
-#   - Counted as Properties (not PrivateFields) in `grouped` & class_layouts
-#   - Properties group containing ANY backing field is exempt from region_missing
-#     (ObservableProperty pattern keeps field+generated-property adjacent; forcing
-#     a #region [Properties] around them would split the pattern artificially)
-#   - Order check uses effective kind = Properties (already done in seen_kinds)
-#   - Blank-line check skips backing-field neighbors (already done)
+# -- Conceptual property units and declaration documentation -----------------
 
-_BACKING_FIELD_NAME = re.compile(r"\bprivate\s+[^;{=]+\s+_([a-z]\w*)\s*[;=]")
+_FIELD_NAME = re.compile(r"\b(?:private|protected)\s+[^;{=]+\s+(_\w+)\s*[;=]")
 
 
-def find_backing_field_indices(
-    members: list["Member"], file_lines: list[str]
-) -> set[int]:
-    """Return set of member indices in `members` that count as backing fields."""
-    backing: set[int] = set()
-    for i, m in enumerate(members):
-        if m.kind != "PrivateFields":
+def find_backing_pairs(members: list[Member], lines: list[str]) -> dict[int, int | None]:
+    """Map a supported backing field to its property, or None for a generated property."""
+    pairs: dict[int, int | None] = {}
+    for i, member in enumerate(members):
+        if member.kind != "PrivateFields":
             continue
-
-        # (a) Direct attribute check — most reliable for CommunityToolkit.Mvvm.
-        # Walk up to 5 non-blank lines above; if any is `[ObservableProperty...]`
-        # (possibly bracketing other attributes like [NotifyPropertyChangedFor]),
-        # treat as backing field.
-        line_idx = m.line - 1  # convert to 0-based file_lines index
-        steps = 0
-        for j in range(line_idx - 1, -1, -1):
-            text = file_lines[j].strip()
-            if not text:
-                continue
-            steps += 1
-            if steps > 5:
+        j = member.line - 2
+        while j >= 0 and (not lines[j].strip() or lines[j].strip().startswith("[")):
+            if re.search(r"\[ObservableProperty(?:\s|\]|\()", lines[j]):
+                pairs[i] = None
                 break
-            if text.startswith("[ObservableProperty"):
-                backing.add(i)
-                break
-            if text.startswith("[") and text.endswith("]"):
-                continue  # another attribute (e.g. [NotifyPropertyChangedFor]) — keep looking
-            break  # non-attribute, non-blank line — stop
-        if i in backing:
+            j -= 1
+        if i in pairs or i + 1 >= len(members) or members[i + 1].kind != "Properties":
             continue
-
-        # (b) Position-based: inside [Properties] region (manual backing fields)
-        if m.region == "[Properties]":
-            backing.add(i)
+        name = _FIELD_NAME.search(member.text)
+        if not name:
             continue
+        prop = members[i + 1]
+        end = prop.end_line or (members[i + 2].line - 1 if i + 2 < len(members) else len(lines))
+        body = "\n".join(lines[prop.line - 1:end])
+        if re.search(rf"(?<!\w){re.escape(name.group(1))}(?!\w)", body):
+            pairs[i] = i + 1
+    return pairs
 
-        # (c) Removed: name-pair fallback `_xxx` ↔ `Xxx` was producing false
-        # positives — ScreenColorPicker has `_wantedCount` + `WantedCount` as
-        # ordinary field+property, NOT an ObservableProperty pattern. Use only
-        # explicit [ObservableProperty] attribute or [Properties] region
-        # placement as backing-field signals.
-    return backing
+
+def has_summary_before(lines: list[str], declaration_line: int) -> bool:
+    """Recognize an adjacent /// summary block, skipping simple attribute lines."""
+    j = declaration_line - 2
+    while j >= 0 and (not lines[j].strip()
+                      or (lines[j].strip().startswith("[") and lines[j].strip().endswith("]"))):
+        j -= 1
+    comments = []
+    while j >= 0 and re.match(r"^\s*///(?!/)", lines[j]):
+        comments.append(lines[j])
+        j -= 1
+    text = "\n".join(reversed(comments))
+    return bool(re.search(r"<summary\s*>", text) and re.search(r"</summary\s*>", text))
 
 
-# -- Check a single class against the 4 sub-rules ----------------------------
-
-def check_class(cls: ClassRecord, file_lines: list[str]) -> tuple[list[dict], dict | None]:
-    """
-    Returns (findings, layout_summary).
-    layout_summary is a per-class full snapshot of all non-empty member groups
-    (kind / count / in_region / status). LLM uses it to spot audit blind spots
-    (e.g. group count under-reported because of parse misses).
-    """
+def check_class(cls: ClassRecord, file_lines: list[str]) -> tuple[list[dict], dict]:
     findings: list[dict] = []
 
-    if len(cls.members) <= 1:
-        return findings, None  # trivial class, no layout to enforce
+    def add(rule: str, line: int, message: str, **extra: object) -> None:
+        findings.append({"rule": rule, "file": cls.file, "line": line,
+                         "class": cls.class_name, "message": message,
+                         "requires_review": True, **extra})
 
-    # Detect backing fields (computed once for the whole class)
-    backing_indices = find_backing_field_indices(cls.members, file_lines)
-    def is_bf(i: int) -> bool:
-        return i in backing_indices
-
-    # Group members by kind — backing fields reclassified into Properties group
-    # (they ARE properties semantically; [ObservableProperty] field IS the property's
-    # storage). Tracked separately so region_missing can exempt mixed groups.
-    grouped: dict[str, list[Member]] = defaultdict(list)
-    properties_has_backing = False
-    for i, m in enumerate(cls.members):
-        if is_bf(i):
-            grouped["Properties"].append(m)
-            properties_has_backing = True
+    pairs = find_backing_pairs(cls.members, file_lines)
+    # (first member index, last member index, effective kind); a backing field
+    # and its actual property count once, and only their internal gap is exempt.
+    units: list[tuple[int, int, str]] = []
+    i = 0
+    while i < len(cls.members):
+        if i in pairs:
+            end = pairs[i] if pairs[i] is not None else i
+            units.append((i, end, "Properties"))
+            i = end + 1
         else:
-            grouped[m.kind].append(m)
+            units.append((i, i, cls.members[i].kind))
+            i += 1
 
-    # Build per-class layout snapshot (every non-empty group, regardless of
-    # whether it triggers any finding). LLM reads this to see if audit's
-    # member-count matches the actual file (e.g. extern methods, partial-class
-    # members, unusual modifier combos may make audit under-count a group).
-    layout_summary: dict = {
-        "file": cls.file,
-        "class": cls.class_name,
-        "line": cls.start_line,
-        "groups": [],
-    }
+    grouped: dict[str, list[tuple[int, int, str]]] = defaultdict(list)
+    for unit in units:
+        grouped[unit[2]].append(unit)
+    layout = {"file": cls.file, "class": cls.class_name, "line": cls.start_line,
+              "member_declarations": len(cls.members), "groups": []}
+    non_empty = sum(bool(grouped.get(kind)) for kind in CANONICAL_ORDER)
     for kind in CANONICAL_ORDER:
-        members = grouped.get(kind, [])
-        if not members:
+        group = grouped.get(kind, [])
+        if not group:
             continue
-        expected_name = CANONICAL_REGION_NAME[kind]
-        in_region = sum(1 for m in members if m.region == expected_name)
-        if in_region == len(members):
-            status = "wrapped"
-        elif in_region == 0:
-            status = "missing"
-        else:
-            status = "partial"
-        layout_summary["groups"].append({
-            "kind": kind,
-            "count": len(members),
-            "in_region": in_region,
-            "expected_region": expected_name,
-            "status": status,
-        })
+        expected = CANONICAL_REGION_NAME[kind]
+        wrapped = sum(all(cls.members[j].region == expected for j in range(start, end + 1))
+                      for start, end, _ in group)
+        required = len(group) >= 2 and non_empty >= 2
+        status = ("wrapped" if wrapped == len(group) else
+                  "optional" if not required else "missing" if wrapped == 0 else "partial")
+        layout["groups"].append({"kind": kind, "count": len(group), "in_region": wrapped,
+                                 "expected_region": expected, "status": status})
+        if required and wrapped < len(group):
+            add("region_missing", cls.members[group[0][0]].line,
+                f"Group '{kind}' has {len(group)} units; some are outside #region {expected}")
 
-    # op_exempt removed (per user direction): all classes report region_missing
-    # by canonical rules. Large ObservableProperty VMs are expected to be
-    # mechanically reorganized into canonical region order (Commands region
-    # added in CANONICAL_ORDER to group [RelayCommand] methods).
-    _canonical_region_names = set(CANONICAL_REGION_NAME.values())
-    any_region_present = any(m.region in _canonical_region_names for m in cls.members)
-    op_exempt = False
+    seen = []
+    for _, _, kind in units:
+        if not seen or seen[-1] != kind:
+            seen.append(kind)
+    order = [CANONICAL_ORDER.index(kind) for kind in seen if kind in CANONICAL_ORDER]
+    if any(left >= right for left, right in zip(order, order[1:])):
+        add("members_out_of_order", cls.start_line,
+            f"Expected {' → '.join(CANONICAL_ORDER)}; actual {' → '.join(seen)}")
 
-    # --- Sub-rule 1: members_out_of_order ---
-    # Backing fields counted as Properties for ordering purposes
-    if not op_exempt:
-        seen_kinds: list[str] = []
-        for i, m in enumerate(cls.members):
-            effective = "Properties" if is_bf(i) else m.kind
-            if not seen_kinds or seen_kinds[-1] != effective:
-                seen_kinds.append(effective)
+    for previous, current in zip(cls.region_blocks, cls.region_blocks[1:]):
+        if not previous.end_line or previous.end_line >= current.start_line:
+            continue  # unfinished or nested regions are not adjacent siblings
+        if not any(not line.strip() for line in file_lines[previous.end_line:current.start_line - 1]):
+            add("region_no_blank_between", current.start_line,
+                f"Regions '{previous.name}' and '{current.name}' need a blank line")
 
-        canonical_idx = -1
-        order_violation = None
-        for kind in seen_kinds:
-            try:
-                idx = CANONICAL_ORDER.index(kind)
-            except ValueError:
-                continue
-            if idx <= canonical_idx:
-                order_violation = (
-                    f"Members are interleaved or out of order. "
-                    f"Expected: {' → '.join(CANONICAL_ORDER)}. "
-                    f"Actual: {' → '.join(seen_kinds)}"
-                )
-                break
-            canonical_idx = idx
-
-        if order_violation:
-            findings.append({
-                "rule": "members_out_of_order",
-                "file": cls.file,
-                "line": cls.start_line,
-                "class": cls.class_name,
-                "message": order_violation,
-            })
-
-    # --- Sub-rule 2: region_missing ---
-    # Two exemptions (per 代码规范.md):
-    #   (a) whole class has only ONE non-empty group — no other groups to separate
-    #   (b) single-member group, KEPT for everything EXCEPT PrivateMethods
-    #
-    # Only PrivateMethods has no single-member exemption:
-    #   - Parser is most likely to under-count this group (extern / [DllImport] /
-    #     complex modifier combos) — a count=1 here may actually be count=2+ in
-    #     the source, and missing the region misses a real consistency issue
-    #     (see DwmDarkChrome case: extern method dropped, real count was 2)
-    #   - The cost of "wrap 1 method" is low compared to a missed extern
-    non_empty_groups = sum(1 for k in CANONICAL_ORDER if grouped.get(k))
-    if non_empty_groups >= 2 and not op_exempt:
-        for kind in CANONICAL_ORDER:
-            members = grouped.get(kind, [])
-            if not members:
-                continue
-            # Single-member exemption (unconditional): wrapping a single member
-            # in its own #region/#endregion is noisy — 1 member doesn't need
-            # navigation help.
-            if len(members) < 2:
-                # If user wrapped a single-member group anyway, report as
-                # redundant (so they can simplify).
-                expected_name = CANONICAL_REGION_NAME[kind]
-                if any(m.region == expected_name for m in members):
-                    findings.append({
-                        "rule": "region_single_member_redundant",
-                        "file": cls.file,
-                        "line": members[0].line,
-                        "class": cls.class_name,
-                        "message": (
-                            f"Group '{kind}' has only 1 member but is wrapped "
-                            f"in '#region {expected_name}' — single-member "
-                            f"regions add noise without navigation benefit; "
-                            f"consider removing the #region/#endregion pair"
-                        ),
-                    })
-                continue
-            expected_name = CANONICAL_REGION_NAME[kind]
-            in_region_count = sum(1 for m in members if m.region == expected_name)
-            if in_region_count < len(members):
-                findings.append({
-                    "rule": "region_missing",
-                    "file": cls.file,
-                    "line": members[0].line,
-                    "class": cls.class_name,
-                    "message": (
-                        f"Group '{kind}' has {len(members)} members but is not "
-                        f"wrapped in '#region {expected_name}' / '#endregion' "
-                        f"(or some members are outside the region)"
-                    ),
-                })
-
-    # --- Sub-rule 3: region_no_blank_between ---
-    for i in range(1, len(cls.region_blocks)):
-        prev = cls.region_blocks[i - 1]
-        curr = cls.region_blocks[i]
-        if prev.end_line == 0 or curr.start_line == 0:
+    for previous, current in zip(units, units[1:]):
+        if previous[2] != current[2] or current[2] not in SPACE_REQUIRED_KINDS:
             continue
-        # Need at least one blank line between prev.end_line and curr.start_line
-        has_blank = any(
-            file_lines[j].strip() == ""
-            for j in range(prev.end_line, curr.start_line - 1)
-        )
-        if not has_blank:
-            findings.append({
-                "rule": "region_no_blank_between",
-                "file": cls.file,
-                "line": curr.start_line,
-                "class": cls.class_name,
-                "message": (
-                    f"Region '{prev.name}' (ends L{prev.end_line}) and "
-                    f"'{curr.name}' (starts L{curr.start_line}) need a "
-                    f"blank line between them"
-                ),
-            })
+        last = cls.members[previous[1]]
+        first = cls.members[current[0]]
+        end = last.end_line or last.line
+        if not any(not line.strip() for line in file_lines[end:first.line - 1]):
+            add("members_no_blank_line", first.line,
+                f"Consecutive {current[2]} units at L{last.line} and L{first.line} need a blank line")
 
-    # --- Sub-rule 4: members_no_blank_line ---
-    for i in range(1, len(cls.members)):
-        prev = cls.members[i - 1]
-        curr = cls.members[i]
-        # Backing fields are tightly coupled — no blank line required between
-        # backing-field and adjacent member (its property)
-        if is_bf(i - 1) or is_bf(i):
-            continue
-        if prev.kind != curr.kind:
-            continue  # different kind: cross-group, handled by region rule
-        if prev.kind not in SPACE_REQUIRED_KINDS:
-            continue
-        has_blank = any(
-            file_lines[j].strip() == ""
-            for j in range(prev.line, curr.line - 1)
-        )
-        if not has_blank:
-            findings.append({
-                "rule": "members_no_blank_line",
-                "file": cls.file,
-                "line": curr.line,
-                "class": cls.class_name,
-                "message": (
-                    f"Two consecutive {curr.kind} members "
-                    f"(L{prev.line} and L{curr.line}) need a blank line between them"
-                ),
-            })
-
-    # --- Sub-rule 5: summary_missing_on_public ---
-    # Check that each public class/method/property/event has a /// <summary>
-    # block directly above. Skip private/internal members and backing fields.
-    # Attribute lines like [Obsolete] between summary and declaration are OK.
-    for i, m in enumerate(cls.members):
-        if is_bf(i):
-            continue
-        if not re.search(r"\bpublic\b", m.text):
-            continue
-        # Only Properties / PublicMethods / Events need summary
-        # (Constructors and fields skipped — Ctor summaries are optional in practice)
-        if m.kind not in ("Properties", "PublicMethods", "Events"):
-            continue
-        # Walk up from member's line, skipping blank lines and attribute lines
-        j = m.line - 2  # 0-indexed; line above declaration
-        while j >= 0:
-            stripped = file_lines[j].strip()
-            if stripped == "":
-                j -= 1
-                continue
-            # Attribute line like [Obsolete] or [Description("...")]
-            if stripped.startswith("[") and stripped.endswith("]"):
-                j -= 1
-                continue
-            break
-        # `j` now points to the first non-blank non-attribute line above
-        if j < 0 or not file_lines[j].strip().startswith("///"):
-            # Effective region for grouping — backing fields conceptually live
-            # in [Properties] even if physically outside any region.
-            region_label = m.region if m.region else "(no region)"
-            findings.append({
-                "rule": "summary_missing_on_public",
-                "file": cls.file,
-                "line": m.line,
-                "class": cls.class_name,
-                "kind": m.kind,
-                "region": region_label,
-                "message": (
-                    f"Public {m.kind} at L{m.line} (region: {region_label}) has "
-                    f"no /// <summary> documentation. "
-                    f"Declaration: `{m.text[:60]}{'...' if len(m.text) > 60 else ''}`"
-                ),
-            })
-
-    return findings, layout_summary
+    # Empty/single-member classes still need declaration documentation.
+    if not has_summary_before(file_lines, cls.start_line):
+        add("summary_missing", cls.start_line, f"{cls.kind} '{cls.class_name}' lacks a summary")
+    for index, member in enumerate(cls.members):
+        if index in pairs or member.kind not in {"Properties", "PublicMethods", "PrivateMethods"}:
+            continue  # fields, events and constructors are not checked here
+        if not has_summary_before(file_lines, member.line):
+            add("summary_missing", member.line,
+                f"{member.kind} declaration lacks a summary: {member.text[:80]}", kind=member.kind)
+    return findings, layout
 
 
-# -- Per-file worker (module-level so multiprocessing.Pool can pickle it) ----
+# -- Per-file worker and command line ----------------------------------------
 
-def _process_file(f: Path) -> tuple[list[dict], list[dict], int, int]:
-    """Returns (findings, layouts, total_classes, clean_classes) for one file."""
-    try:
-        classes = parse_file(f)
-        file_lines = f.read_text(encoding="utf-8-sig", errors="replace").splitlines()
-    except OSError:
-        return [], [], 0, 0
-    findings_local: list[dict] = []
-    layouts_local: list[dict] = []
-    total = 0
-    clean = 0
+
+def _process_file(item: tuple[Path, str]) -> tuple[list[dict], list[dict], int, int]:
+    path, encoding = item
+    lines = read_source(path, encoding).splitlines()
+    classes = parse_file(path, lines)
+    findings, layouts = [], []
+    without_findings = 0
     for cls in classes:
-        total += 1
-        cls_findings, cls_layout = check_class(cls, file_lines)
-        if cls_findings:
-            findings_local.extend(cls_findings)
-        else:
-            clean += 1
-        if cls_layout is not None:
-            layouts_local.append(cls_layout)
-    return findings_local, layouts_local, total, clean
-
-
-# -- Scope resolution + main -------------------------------------------------
-
-_GENERATED_DIRS = {"obj", "bin", "Generated", ".vs"}
-_GENERATED_SUFFIXES = (
-    ".g.cs", ".g.i.cs", ".Designer.cs", ".designer.cs",
-    ".AssemblyInfo.cs", ".AssemblyAttributes.cs", ".GlobalUsings.g.cs",
-)
-
-
-def _is_generated(p: Path) -> bool:
-    """Filter out compiler-generated / build artifact .cs files."""
-    name = p.name
-    if any(name.endswith(s) for s in _GENERATED_SUFFIXES):
-        return True
-    # Walk parents, skip if any segment is obj/bin/etc.
-    return any(part in _GENERATED_DIRS for part in p.parts)
-
-
-def resolve_cs_files(scope: Path, include_from: Path | None = None) -> list[Path]:
-    """If `include_from` is given, filter universe to files listed (one per line)."""
-    if scope.is_file():
-        if scope.suffix.lower() == ".cs":
-            universe = [scope]
-        elif scope.suffix.lower() in (".csproj", ".sln"):
-            universe = [p for p in sorted(scope.parent.rglob("*.cs")) if not _is_generated(p)]
-        else:
-            raise ValueError(f"Scope must be .cs / .csproj / .sln, got: {scope.suffix}")
-    elif scope.is_dir():
-        universe = [p for p in sorted(scope.rglob("*.cs")) if not _is_generated(p)]
-    else:
-        raise ValueError(f"Scope not found: {scope}")
-
-    if include_from is None:
-        return universe
-
-    if not include_from.exists():
-        raise ValueError(f"--include-from file not found: {include_from}")
-    wanted_text = include_from.read_text(encoding="utf-8-sig", errors="replace")
-    wanted = set()
-    for line in wanted_text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        try:
-            wanted.add(Path(line).resolve())
-        except OSError:
-            continue
-
-    universe_resolved = {f.resolve(): f for f in universe}
-    return [universe_resolved[w] for w in wanted if w in universe_resolved]
-
-
-def default_output_path() -> Path:
-    tmp = os.environ.get("TEMP") or os.environ.get("TMPDIR") or "/tmp"
-    return Path(tmp) / "class-layout-audit.json"
+        found, layout = check_class(cls, lines)
+        findings.extend(found)
+        layouts.append(layout)
+        without_findings += not found
+    return findings, layouts, len(classes), without_findings
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
-    p.add_argument("--scope", default=".",
-                   help="File / directory / .csproj / .sln")
-    p.add_argument("--include-from", default=None,
-                   help="Path to a text file listing .cs files to audit (one per line). "
-                        "Only files in this list AND under --scope are scanned.")
-    p.add_argument("--output", default=str(default_output_path()),
-                   help="Output JSON path (default: $TEMP/class-layout-audit.json)")
-    p.add_argument("--quiet", action="store_true")
-    p.add_argument("--jobs", type=int, default=1,
-                   help="Parallel workers for file parsing (default: 1, single-process). "
-                        "Use 4-8 on large projects (5k+ files) for 3-5x speedup.")
-    args = p.parse_args()
-
+    parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    add_scan_arguments(parser)
+    args = parser.parse_args()
+    if args.jobs < 1:
+        parser.error("--jobs must be a positive integer")
     scope = Path(args.scope).resolve()
-    include_from = Path(args.include_from).resolve() if args.include_from else None
+    manifest = Path(args.include_from) if args.include_from else None
     try:
-        files = resolve_cs_files(scope, include_from)
-    except ValueError as e:
-        print(str(e), file=sys.stderr)
+        files = resolve_cs_files(scope, manifest, args.include_generated, args.encoding)
+        if not files:
+            print(f"No eligible .cs files in scope: {scope}", file=sys.stderr)
+            return 2
+        items = [(path, args.encoding) for path in files]
+        if args.jobs > 1 and len(files) > 50:
+            from multiprocessing import Pool
+            with Pool(args.jobs) as pool:
+                results = list(pool.imap(_process_file, items, chunksize=20))
+        else:
+            results = map(_process_file, items)
+        all_findings, all_layouts = [], []
+        total = without_findings = 0
+        for findings, layouts, count, no_findings in results:
+            all_findings.extend(findings)
+            all_layouts.extend(layouts)
+            total += count
+            without_findings += no_findings
+        all_findings.sort(key=lambda finding: (finding["file"], finding["line"], finding["rule"]))
+        all_layouts.sort(key=lambda layout: (layout["file"], layout["line"]))
+        output = {
+            "schema_version": 2, "scope": str(scope), "scanned_files": len(files),
+            "files": [str(path) for path in files], "scanned_classes": total,
+            "classes_without_findings": without_findings, "requires_review": True,
+            "note": "Heuristic candidates only. Braces in strings/comments, nested types, "
+                    "partial aggregation, complex signatures/attributes, record declarations "
+                    "and preprocessor branches can cause missed or spurious findings. "
+                    "Review relevant source manually; zero findings does not prove compliance.",
+            "findings": all_findings, "class_layouts": all_layouts,
+        }
+        output_path = write_report(output, args.output, "class-layout-audit.json")
+    except (OSError, ValueError, UnicodeError) as error:
+        print(f"Audit failed: {error}", file=sys.stderr)
         return 1
-    if not files:
-        print(f"No .cs files found under: {scope}", file=sys.stderr)
-        return 2
-
-    if not args.quiet:
-        print(f"[*] Scanning {len(files)} .cs file(s) under {scope}")
-
-    all_findings: list[dict] = []
-    all_layouts: list[dict] = []
-    total_classes = 0
-    clean_classes = 0
-
-    if args.jobs > 1 and len(files) > 50:
-        # Parallelize only when worthwhile (large file set). Worker function
-        # `_process_file` lives at module level so it's picklable on Windows.
-        from multiprocessing import Pool
-        with Pool(args.jobs) as pool:
-            for findings_local, layouts_local, total, clean in pool.imap_unordered(_process_file, files, chunksize=20):
-                all_findings.extend(findings_local)
-                all_layouts.extend(layouts_local)
-                total_classes += total
-                clean_classes += clean
-    else:
-        for f in files:
-            findings_local, layouts_local, total, clean = _process_file(f)
-            all_findings.extend(findings_local)
-            all_layouts.extend(layouts_local)
-            total_classes += total
-            clean_classes += clean
-
-    by_rule: dict[str, int] = defaultdict(int)
-    for f in all_findings:
-        by_rule[f["rule"]] += 1
-
-    output = {
-        "scope": str(scope),
-        "scanned_files": len(files),
-        "scanned_classes": total_classes,
-        "clean_classes": clean_classes,
-        "generated_at_note": (
-            "Run by class-layout-check.py. Heuristic regex parser — may miss "
-            "nested/partial classes, multi-line attribute decorations, multi-line "
-            "expression bodies. LLM should spot-check a few findings against the "
-            "actual file before batch-applying fixes. The `class_layouts` array "
-            "gives per-class group snapshots so LLM can verify audit's member "
-            "counts match the actual file — flag any discrepancy as a likely "
-            "parser miss."
-        ),
-        "findings": all_findings,
-        "class_layouts": all_layouts,
-    }
-
-    Path(args.output).write_text(
-        json.dumps(output, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-    if not args.quiet:
-        print()
-        print(f"[OK] Class layout audit written to: {args.output}")
-        print()
-        print(f"Scanned: {total_classes} class(es) in {len(files)} file(s)")
-        print(f"Clean:   {clean_classes} class(es)")
-        print(f"Issues:  {len(all_findings)} finding(s) in {total_classes - clean_classes} class(es)")
-        if all_findings:
-            print()
-            print("Per-rule:")
-            for rule in sorted(by_rule):
-                print(f"  {rule:<25} {by_rule[rule]:>5}")
-
+    if not args.quiet and args.output != "-":
+        print(f"Scanned {total} class declaration(s); {len(all_findings)} candidate(s)")
+    if output_path is not None:
+        print(output_path)
     return 0
 
 

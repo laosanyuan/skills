@@ -5,20 +5,20 @@ C# style compliance grep audit. 12 rules (Cmd suffix / Attribute/Exception
 suffix / I prefix / Chinese identifier / private field _ / anonymous delegate
 / if-no-braces / float == / enum.ToString suspect / summary inline /
 comment terminal period).
-Deterministic filters applied; `violations` is the actionable list.
-`enum_tostring_suspect` and rare comment-shaped candidates inside multiline
-strings/comments still need LLM context-reading to confirm.
+All findings are candidates, including matches retained by filters. Confirm
+syntax context and applicable semantics before any edit; this is not a C# parser.
 
     python compliance-grep.py --scope path/to/src
     python compliance-grep.py --scope src --include-from changed.txt --jobs 4
+    python compliance-grep.py --scope One.cs --rules summary_inline comment_terminal_period --output -
 """
 
 import argparse
-import json
-import os
 import re
 import sys
 from pathlib import Path
+
+from scan_scope import add_scan_arguments, read_source, resolve_cs_files, write_report
 
 # Force UTF-8 stdout on Windows where the console codepage may be CP936 etc.
 # (data file output is UTF-8 anyway; this only affects what user sees in terminal)
@@ -28,90 +28,90 @@ except (AttributeError, OSError):
     pass
 
 
-# -- Rule set: mirrors compliance-check.md Section 3 -------------------------
+# -- Rule set: mirrors compliance-check.md text candidate table --------------
 
 RULES = [
     {
         "key": "cmd_suffix",
         "name": "Cmd 后缀禁用",
-        "rule_source": "良好习惯表: 绑定命令属性统一以 Command 结尾,禁止使用 Cmd 缩写",
-        "filter_hint": "无需过滤,全部是违规",
+        "rule_source": "命名与基本格式: 绑定命令属性统一以 Command 结尾,不用 Cmd",
+        "filter_hint": "保留候选；须确认真实绑定命令属性，不是普通变量、外部 API 或字符串",
         "pattern": r"\b\w+Cmd\b\s*(\{|=>|;)",
     },
     {
         "key": "attribute_no_suffix",
         "name": "自定义 Attribute 缺后缀",
-        "rule_source": "良好习惯表: 自定义的属性以 Attribute 结尾",
-        "filter_hint": "丢弃: 类名以 \"Attribute\" 结尾的(合规)。保留: 不以 Attribute 结尾的(违规)",
+        "rule_source": "命名与基本格式: 自定义特性使用 Attribute 后缀",
+        "filter_hint": "过滤已有 Attribute 后缀的声明，其余候选需确认真实类型和继承关系",
         "pattern": r"\bclass\s+\w+\s*:\s*[^;{]*Attribute\b",
     },
     {
         "key": "exception_no_suffix",
         "name": "自定义 Exception 缺后缀",
-        "rule_source": "良好习惯表: 自定义的异常以 Exception 结尾",
-        "filter_hint": "丢弃: 类名以 \"Exception\" 结尾的(合规)。保留: 不以 Exception 结尾的(违规)",
+        "rule_source": "命名与基本格式: 自定义异常使用 Exception 后缀",
+        "filter_hint": "过滤已有 Exception 后缀的声明，其余候选需确认真实类型和继承关系",
         "pattern": r"\bclass\s+\w+\s*:\s*[^;{]*Exception\b",
     },
     {
         "key": "interface_no_i_prefix",
         "name": "接口缺 I 前缀",
-        "rule_source": "良好习惯表: 接口的名称加前缀 I",
-        "filter_hint": "丢弃: 接口名匹配 ^I[A-Z](合规)。保留: 不匹配的(违规)",
+        "rule_source": "命名与基本格式: 接口使用 I + PascalCase",
+        "filter_hint": "过滤接口名匹配 ^I[A-Z] 的候选；其余需确认真实接口声明",
         "pattern": r"\binterface\s+\w+",
     },
     {
         "key": "chinese_identifier",
         "name": "中文标识符",
-        "rule_source": "良好习惯表: 所有标识符必须使用英文,禁止中文",
-        "filter_hint": "无需过滤,全部是违规。字符串内容和 // 注释里的中文允许,grep 已限定标识符位置",
+        "rule_source": "命名与基本格式: 标识符使用英文，不用中文",
+        "filter_hint": "保留候选；须确认真实标识符，排除字符串和注释中的同形文本",
         "pattern": r"\b(public|private|protected|internal|static|class|interface|enum|void|var|string|int|bool|double|float|decimal|object|dynamic)\s+\w*[一-鿿]\w*",
     },
     {
         "key": "private_field_no_underscore",
         "name": "私有字段缺 _ 前缀",
-        "rule_source": "大小写表 + 良好习惯表: 私有成员变量前加前缀 _",
-        "filter_hint": "丢弃: const/static readonly(常量风格),event/delegate(不是字段),字段名以 _ 开头(合规)",
+        "rule_source": "命名与基本格式: 私有字段含 static/readonly 使用 _camelCase",
+        "filter_hint": "丢弃 const、event/delegate 和已有 _ 前缀；static readonly 仍是字段；其余候选须确认声明上下文",
         "pattern": r"\bprivate\s+[^;{=]+\s+\w+\s*[;=]",
     },
     {
         "key": "anonymous_delegate",
         "name": "匿名委托",
-        "rule_source": "表达式与语句 6: 禁止使用匿名委托,全部换成具名函数",
-        "filter_hint": "无需过滤,全部是违规",
+        "rule_source": "需语义评估的写法建议: 匿名 delegate 提取需检查闭包与委托身份",
+        "filter_hint": "先确认真实匿名委托与捕获、实例身份、订阅/退订和生命周期；候选不代表必须提取具名函数",
         "pattern": r"\bdelegate\s*\(",
     },
     {
         "key": "no_braces_on_control_flow",
         "name": "if/for/while 单语句不加 { }",
-        "rule_source": "良好习惯表: 始终使用 \"{ }\" 包含 if 下的语句",
-        "filter_hint": "丢弃: 单行 inline return/throw/continue/break/yield,以及 Allman 风格(`)` 后无内容下一行 `{`)",
+        "rule_source": "表达式与语句 1: 控制语句的受控语句使用大括号",
+        "filter_hint": "inline return/throw/continue/break/yield 同样需要大括号；嵌套括号和跨行控制体须人工确认",
         "pattern": r"\b(if|for|while|foreach)\s*\([^)]*\)\s*[^\s{/]",
     },
     {
         "key": "float_equality",
         "name": "浮点 == / != 比较",
-        "rule_source": "表达式与语句 4: 不可将浮点变量用 == 或 != 与任何数字比较",
-        "filter_hint": "丢弃: == null / != null 比较(合法)",
+        "rule_source": "需语义评估的写法建议: 浮点比较按业务精度与契约评估",
+        "filter_hint": "排除 null 比较；确认实际类型、NaN/无穷大和精度契约，不能自动改成 epsilon 比较",
         "pattern": r"\b(float|double|decimal)\b[^={]*[=!]=",
     },
     {
         "key": "enum_tostring_suspect",
         "name": "enum.ToString() 嫌疑",
-        "rule_source": "特殊事项: 禁止枚举 ToString() 用于赋值或判断",
-        "filter_hint": "【高误判率】丢弃 int/DateTime/double/decimal/GUID/bool 等非 enum ToString。保留真 enum ToString。**必须逐个开文件确认左侧类型**",
+        "rule_source": "需语义评估的写法建议: 枚举文本用于外部协议或持久化时评估稳定性",
+        "filter_hint": "先确认左侧类型与文本用途；枚举 ToString 不等于违规，不自动替换 Description；确认值、Flags、未定义值及本地化契约",
         "pattern": r"\.ToString\(\)",
     },
     {
         "key": "summary_inline",
         "name": "<summary> 标签未独占行",
-        "rule_source": "方法注释规范 11: <summary>/</summary> 必须各占一行,内容夹中间独占一行",
+        "rule_source": "标签布局与标点: <summary>/</summary> 必须各占物理行，内容放中间",
         "filter_hint": "候选限定为行首 /// 并排除 ////;打开上下文确认不在块注释/多行字符串内。真实文档注释只放行整行内容恰好为 <summary> 或 </summary>",
         "pattern": r"^\s*///(?!/).*?</?summary(?=[\s/>]|$)",
     },
     {
         "key": "comment_terminal_period",
         "name": "注释内容以句号结尾",
-        "rule_source": "代码注释约定 3: 注释内容结尾省略中文句号和英文句号",
+        "rule_source": "标签布局与标点: 注释结尾省略中英文句末句号",
         "filter_hint": "覆盖常见 //、///、行尾注释和块注释形态;英文省略号已过滤。打开上下文确认真实注释边界，并确认 ASCII 点不是缩写或字面数据的一部分",
         "pattern": r"(?:^\s*\*|/\*|//).*?(?:。|\.)(?:\s*</[A-Za-z_][\w:.-]*\s*>)*\s*(?:\*/)?\s*$",
     },
@@ -119,12 +119,7 @@ RULES = [
 
 
 # -- Per-rule deterministic filters ------------------------------------------
-# Each filter: takes the candidate's line text, returns True if it's a real
-# violation (keep), False if it's a deterministic false-positive (drop).
-
-NO_FILTER_RULES = {"cmd_suffix", "chinese_identifier", "anonymous_delegate",
-                   "enum_tostring_suspect"}
-
+# Each filter reduces obvious false positives; True still means candidate only.
 
 def _filter_attribute_no_suffix(text: str) -> bool:
     m = re.search(r"\bclass\s+(\w+)\s*:", text)
@@ -149,8 +144,8 @@ def _filter_interface_no_i_prefix(text: str) -> bool:
 
 
 def _filter_private_field_no_underscore(text: str) -> bool:
-    # Drop const / static readonly (constants use Pascal naming)
-    if re.search(r"\bprivate\s+(const|static\s+readonly)\b", text):
+    # const is not a field; static readonly still follows private field naming
+    if re.search(r"\bconst\b", text.split("=", 1)[0]):
         return False
     # Drop events and delegates (not fields)
     if re.search(r"\bprivate\s+(event|delegate)\s+", text):
@@ -162,9 +157,6 @@ def _filter_private_field_no_underscore(text: str) -> bool:
 
 
 def _filter_no_braces_on_control_flow(text: str) -> bool:
-    # Drop inline early-exit / yield forms
-    if re.search(r"\b(if|for|while|foreach)\s*\([^)]*\)\s*(return|throw|continue|break|yield\s+(return|break))\b", text):
-        return False
     # Drop Allman-style — line starts with control keyword + balanced parens + nothing meaningful after
     if re.match(r"^\s*\b(if|for|while|foreach)\b\s*\(.*\)\s*$", text):
         opens = text.count("(")
@@ -193,7 +185,7 @@ def _filter_comment_terminal_period(text: str) -> bool:
     """Keep comment-shaped text ending in a period, excluding ellipses."""
     payload = re.sub(r"\s*\*/\s*$", "", text).rstrip()
     payload = re.sub(
-        r"(?:\s*</[A-Za-z_][\w:.-]*>)+\s*$",
+        r"(?:\s*</[A-Za-z_][\w:.-]*\s*>)+\s*$",
         "",
         payload,
     ).rstrip()
@@ -214,220 +206,94 @@ FILTERS = {
 }
 
 
-# -- Scope resolution + file iteration ---------------------------------------
-
-def resolve_cs_files(scope: Path, include_from: Path | None = None) -> list[Path]:
-    """
-    Return list of .cs files under the given scope.
-
-    If `include_from` is given, treat that file as a newline-separated list of
-    .cs paths and use only those (filtered to ones under `scope`). This lets
-    callers limit the audit to a specific file set — e.g., "only the files
-    that dotnet format just touched" using `dotnet format --report`'s JSON.
-    """
-    # Build the universe of .cs files under scope
-    if scope.is_file():
-        if scope.suffix.lower() == ".cs":
-            universe = [scope]
-        elif scope.suffix.lower() in (".csproj", ".sln"):
-            universe = sorted(scope.parent.rglob("*.cs"))
-        else:
-            raise ValueError(f"Scope must be .cs / .csproj / .sln, got: {scope.suffix}")
-    elif scope.is_dir():
-        universe = sorted(scope.rglob("*.cs"))
-    else:
-        raise ValueError(f"Scope path not found or invalid: {scope}")
-
-    if include_from is None:
-        return universe
-
-    # Read include-from file: one .cs path per line (empty / # comment lines skipped)
-    if not include_from.exists():
-        raise ValueError(f"--include-from file not found: {include_from}")
-    wanted_text = include_from.read_text(encoding="utf-8-sig", errors="replace")
-    wanted = set()
-    for line in wanted_text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        try:
-            wanted.add(Path(line).resolve())
-        except OSError:
-            continue
-
-    # Intersect with universe (avoid auditing files outside scope by accident)
-    universe_resolved = {f.resolve(): f for f in universe}
-    return [universe_resolved[w] for w in wanted if w in universe_resolved]
-
-
-# -- Run regex over files ----------------------------------------------------
-
-def run_pattern(pattern: str, files: list[Path]) -> list[dict]:
-    """
-    Return list of {file, line, text} for matches of `pattern` across `files`.
-    Case-sensitive (C# is case-sensitive — `ForEach` LINQ ≠ `foreach` keyword).
-    """
-    rx = re.compile(pattern)
-    hits = []
-    for f in files:
-        try:
-            content = f.read_text(encoding="utf-8-sig", errors="replace")
-        except OSError:
-            continue
-        for lineno, line in enumerate(content.splitlines(), start=1):
-            if rx.search(line):
-                hits.append({"file": str(f), "line": lineno, "text": line.strip()})
-    return hits
-
-
-# -- Per-file scan (single-pass: scan all rules on each file once) -----------
-# Module-level so multiprocessing.Pool can pickle it on Windows.
+# -- Per-file scan -----------------------------------------------------------
 
 _COMPILED_RULES: list[tuple[str, "re.Pattern"]] = []
 
 
 def _init_compiled_rules() -> None:
-    """Initialize once (called per-process in main + worker)."""
     global _COMPILED_RULES
     if not _COMPILED_RULES:
         _COMPILED_RULES = [(r["key"], re.compile(r["pattern"])) for r in RULES]
 
 
-def _scan_file(f: Path) -> dict[str, list[dict]]:
-    """Scan a single .cs file against all rules in one pass. Returns {key: [hits]}."""
+def _scan_file(item: tuple[Path, str, tuple[str, ...]]) -> dict[str, list[dict]]:
+    path, encoding, rule_keys = item
     _init_compiled_rules()
-    hits_by_key: dict[str, list[dict]] = {key: [] for key, _ in _COMPILED_RULES}
-    try:
-        content = f.read_text(encoding="utf-8-sig", errors="replace")
-    except OSError:
-        return hits_by_key
-    f_str = str(f)
-    for lineno, line in enumerate(content.splitlines(), start=1):
-        text = line.strip()
-        for key, rx in _COMPILED_RULES:
-            if rx.search(line):
-                hits_by_key[key].append({"file": f_str, "line": lineno, "text": text})
+    compiled = [(key, pattern) for key, pattern in _COMPILED_RULES if key in rule_keys]
+    hits_by_key: dict[str, list[dict]] = {key: [] for key, _ in compiled}
+    for lineno, line in enumerate(read_source(path, encoding).splitlines(), 1):
+        for key, pattern in compiled:
+            if pattern.search(line):
+                hits_by_key[key].append({"file": str(path), "line": lineno, "text": line.strip()})
     return hits_by_key
 
 
-# -- Main --------------------------------------------------------------------
-
-def default_output_path() -> Path:
-    tmp = os.environ.get("TEMP") or os.environ.get("TMPDIR") or "/tmp"
-    return Path(tmp) / "compliance-audit.json"
-
-
 def main() -> int:
-    p = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
-    p.add_argument("--scope", default=".",
-                   help="File / directory / .csproj / .sln (default: current dir)")
-    p.add_argument("--include-from", default=None,
-                   help="Path to a text file listing .cs files to audit (one per line). "
-                        "Only files in this list AND under --scope are scanned. Useful for "
-                        "auditing just the files dotnet format touched.")
-    p.add_argument("--output", default=str(default_output_path()),
-                   help="Output JSON path (default: $TEMP/compliance-audit.json)")
-    p.add_argument("--quiet", action="store_true",
-                   help="Suppress per-rule progress output")
-    p.add_argument("--jobs", type=int, default=1,
-                   help="Parallel workers for file scanning (default: 1, single-process). "
-                        "Use 4-8 on large projects (5k+ files) for 3-5x speedup. Auto-disabled "
-                        "if fewer than 50 files.")
-    args = p.parse_args()
-
+    parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    add_scan_arguments(parser)
+    parser.add_argument("--rules", nargs="+", choices=[rule["key"] for rule in RULES],
+                        help="Check only these rule keys; omitted means all rules. Selection does not prove overall compliance")
+    args = parser.parse_args()
+    if args.jobs < 1:
+        parser.error("--jobs must be a positive integer")
     scope = Path(args.scope).resolve()
-    include_from = Path(args.include_from).resolve() if args.include_from else None
+    manifest = Path(args.include_from) if args.include_from else None
+    selected_rules = [rule for rule in RULES if args.rules is None or rule["key"] in args.rules]
+    rule_keys = tuple(rule["key"] for rule in selected_rules)
     try:
-        files = resolve_cs_files(scope, include_from)
-    except ValueError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    if not files:
-        print(f"No .cs files found under: {scope}", file=sys.stderr)
-        return 2
+        files = resolve_cs_files(scope, manifest, args.include_generated, args.encoding)
+        if not files:
+            print(f"No eligible .cs files in scope: {scope}", file=sys.stderr)
+            return 2
 
-    if not args.quiet:
-        print(f"[*] Scanning {len(files)} .cs file(s) under {scope}")
-        print()
-
-    # Single-pass per file (all rules scanned at once), optionally parallel.
-    # Each file produces {rule_key: [hits]}, aggregated to per-rule candidates.
-    _init_compiled_rules()
-    candidates_by_key: dict[str, list[dict]] = {r["key"]: [] for r in RULES}
-
-    if args.jobs > 1 and len(files) > 50:
-        from multiprocessing import Pool
-        with Pool(args.jobs) as pool:
-            for hits_by_key in pool.imap_unordered(_scan_file, files, chunksize=20):
-                for key, hits in hits_by_key.items():
-                    candidates_by_key[key].extend(hits)
-    else:
-        for f in files:
-            hits_by_key = _scan_file(f)
+        candidates_by_key: dict[str, list[dict]] = {key: [] for key in rule_keys}
+        items = [(path, args.encoding, rule_keys) for path in files]
+        if args.jobs > 1 and len(files) > 50:
+            from multiprocessing import Pool
+            with Pool(args.jobs) as pool:
+                scanned = list(pool.imap(_scan_file, items, chunksize=20))
+        else:
+            scanned = map(_scan_file, items)
+        for hits_by_key in scanned:
             for key, hits in hits_by_key.items():
                 candidates_by_key[key].extend(hits)
 
-    results = []
-    for rule in RULES:
-        candidates = candidates_by_key[rule["key"]]
-        if rule["key"] in NO_FILTER_RULES:
-            violations = candidates
-            filter_applied = False
-        else:
-            flt = FILTERS.get(rule["key"], lambda _: True)
-            violations = [c for c in candidates if flt(c["text"])]
-            filter_applied = True
-
-        results.append({
-            "key": rule["key"],
-            "name": rule["name"],
-            "rule_source": rule["rule_source"],
-            "filter_hint": rule["filter_hint"],
-            "pattern": rule["pattern"],
-            "candidate_count": len(candidates),
-            "violation_count": len(violations),
-            "deterministic_filter_applied": filter_applied,
-            "violations": violations,
-        })
-
-        if not args.quiet:
-            msg = f"  [..] {rule['name']:<30} {len(violations)} violation(s)"
-            if len(candidates) != len(violations):
-                msg += f" (filtered out {len(candidates) - len(violations)} of {len(candidates)} candidates)"
-            print(msg)
-
-    output = {
-        "scope": str(scope),
-        "scanned_files": len(files),
-        "generated_at_note": (
-            "Run by compliance-grep.py. Deterministic filters already applied — "
-            "`violations` is the LLM-actionable list. For `enum_tostring_suspect`, "
-            "LLM still needs to confirm the left-side type. For `summary_inline` "
-            "and `comment_terminal_period`, LLM confirms rare comment-shaped matches "
-            "are not inside multiline strings or block comments."
-        ),
-        "rules": results,
-    }
-
-    Path(args.output).write_text(
-        json.dumps(output, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-    if not args.quiet:
-        print()
-        print(f"[OK] Audit results written to: {args.output}")
-        print()
-        print("Per-rule violation counts (after deterministic filter):")
-        for r in results:
-            extra = ""
-            if r["candidate_count"] != r["violation_count"]:
-                extra = f" (was {r['candidate_count']} before filter)"
-            print(f"  {r['name']:<40} {r['violation_count']:>5}{extra}")
-        print()
-        print("Next: LLM reads the JSON and confirms `enum_tostring_suspect` plus "
-              "rare comment-shaped string/block-comment lookalikes in context.")
-
+        results = []
+        for rule in selected_rules:
+            raw = sorted(candidates_by_key[rule["key"]],
+                         key=lambda hit: (hit["file"], hit["line"], hit["text"]))
+            flt = FILTERS.get(rule["key"])
+            candidates = [hit for hit in raw if flt is None or flt(hit["text"])]
+            results.append({
+                **rule,
+                "raw_candidate_count": len(raw),
+                "candidate_count": len(candidates),
+                "filter_applied": flt is not None,
+                "requires_review": True,
+                "candidates": candidates,
+            })
+            if not args.quiet and args.output != "-":
+                print(f"  {rule['name']}: {len(candidates)} candidate(s)")
+        output = {
+            "schema_version": 2,
+            "scope": str(scope),
+            "scanned_files": len(files),
+            "files": [str(path) for path in files],
+            "requires_review": True,
+            "note": "Regex candidates only; review all matches and relevant unmatched code. "
+                    "A zero candidate count is not proof of compliance. Exit 0 means scan completed.",
+            "rules": results,
+        }
+        if args.rules is not None:
+            output["selected_rules"] = list(rule_keys)
+            output["unchecked_rules"] = [rule["key"] for rule in RULES if rule["key"] not in rule_keys]
+        output_path = write_report(output, args.output, "compliance-audit.json")
+    except (OSError, ValueError, UnicodeError) as error:
+        print(f"Audit failed: {error}", file=sys.stderr)
+        return 1
+    if output_path is not None:
+        print(output_path)
     return 0
 
 

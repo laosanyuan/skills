@@ -1,433 +1,128 @@
-# C# 合规审计 — 找违规 + 修违规(配套 SKILL.md Section 6/7/8)
+# C# 检查与修复指南
 
-本文档配套 SKILL.md **Section 6(audit 找违规)+ Section 7(按破坏性分批实施)+ Section 8(全流程终极汇总)** 的语义流。**默认两条腿走路时,这一套和 dotnet format 主流程都跑**。
+配合 [SKILL.md](../SKILL.md) 的规范审查使用。默认约定来自 [代码规范](代码规范.md)，用户明确指令与适用仓库约束优先；冲突需记录，不通过擅改配置或安装目录里的规范解决。
 
-`dotnet format` 把 `.editorconfig` + 内置 IDE/style/analyzer 规则覆盖的部分修了,但**风格指南里总有一堆 dotnet format 处理不了的语义规则**(后缀约定、命名禁令、注释完整性、写法禁令等)。这份文档:
-- Section 1-4: 怎么把违规查出来(audit)
-- Section 5: audit 报告格式(SKILL.md Section 7 实施的输入)
-- Section 6: 审计阶段不该做的事
-- Section 7: per-rule 修复细则(SKILL.md Section 7 实施细则展开)
-- Section 8: 全流程终极汇总 mock 范例
+## 审计流程与覆盖
 
----
+1. 确认用户目标、实际文件集、规则和原有改动
+2. 全量规范审查运行两个只读脚本；局部任务选择相关检查。小报告用 `--output -` 直接读取 JSON，大报告用不同的显式 `.json` 输出路径
+3. 读取 JSON、确认扫描成功，查看成员快照，再逐条读上下文确认候选
+4. 补充脚本覆盖不到的职责、契约、命名语义和布局检查
+5. 只读请求到报告为止；修改请求按权限和行为风险小批实施，再做定向验证
 
-## 1. 规则来源 — 嵌入在 skill 里的 `代码规范.md`
+### 文件范围与输出
 
-**规则的唯一权威来源**是同目录下的 [`代码规范.md`](./代码规范.md)(本 skill 自带的副本)。**不在用户的项目里搜风格指南文档** —— 项目里有没有 `代码规范.md` / `STYLE_GUIDE.md` 都不影响,skill 自己自带一份固定的规则集。
+- `.cs` 表示单文件；目录表示该目录下的源码，而非某项目的 Compile 集
+- 两个审计脚本不评估 MSBuild，直接传 `.csproj` / `.sln` / `.slnx` 会明确报错。项目成员可能受 Import、Condition、通配符、Remove、链接文件和配置影响，不得把父目录扫描当作准确项目范围。先核实实际 Compile 项，再用共同目录 + 精确清单收窄；链接文件可按已授权路径分别扫描。不能解析时明确报告范围限制
+- `--include-from` 是每行一个 `.cs` 路径的 UTF-8 清单，支持空行和 `#` 注释；相对路径以清单所在目录为基准，推荐绝对路径。缺失、非源码或越出 scope 的条目报错，不静默忽略。清单用于收窄目标，不隐式扩大权限
+- 默认排除 bin/obj、常见生成文件名与 auto-generated 文件头；`--include-generated` 仅在用户明确要求时使用。第三方目录需另行按任务范围排除。空范围不能算通过
+- `--encoding auto` 检测 UTF-8/UTF-16 BOM，否则严格按 UTF-8；旧代码可显式提供编码。读失败、非法编码或输出失败必须非零退出，不能当作零候选
+- `--output -` 只向 stdout 输出一份 JSON，不创建报告文件；`--quiet` 不隐藏这份 JSON。命令使用 `python -B` 可避免技能目录产生字节码缓存
+- grep 的 `--rules <key> [<key> ...]` 限定文本候选类别，省略时保持全部规则；未知 key 或空参数报错。结果保持规范表顺序，重复 key 只检查一次，报告列出 `selected_rules` / `unchecked_rules`。例如仅注释任务选择 `summary_inline comment_terminal_period`，不为局部请求输出其他十类候选；全量审查不收窄规则，布局脚本没有此参数
+- 文件输出放已授权写入根下的本轮独立目录；未提供 `--output` 时仍按兼容行为在系统 Temp 创建唯一报告，即使使用 `--quiet` 也打印路径。因此受限任务应显式选择 stdout 或获准路径，不依赖默认位置
+- 退出 `0` 表示扫描成功，不表示合规。grep 使用 `raw_candidate_count`、`candidate_count`、`candidates`、`requires_review`；布局使用 `findings`、`class_layouts`。这些均为待复核候选，不再叫已确认 violations
 
-**为什么内嵌不靠路径搜:**
-- 用户在不同项目跨切时,规则保持一致(不会因为某个项目没有规范文档就跳过审计)
-- 规则版本可控(由 skill 维护,不会因为某个项目仓库里规范文档没更新就漏检)
-- 不会和项目自带的非格式化文档(README/CHANGELOG/TODO 等)冲突
+支持 `-getItem` 的 MSBuild 可用以下只读求值检查当前配置的成员；以输出中的 `Items.Compile[*].FullPath` 为准核实清单，而非猜测目录包含关系：
 
-**先做的事:** 进入第 6 节时,**Read `代码规范.md` 一遍**,把规则吸收进来。后续每条违规要在报告里**引用 `代码规范.md` 的具体行号或章节**,用户才知道是哪条规则。
-
-**规范不是这份 skill 的产品 —— 是用户组织的规则。** 如果用户说"我们规范不是这样"、"这条规则不适用了"、"加一条新的",指引用户**直接编辑这个文件**(`~/.claude/skills/format-csharp/references/代码规范.md`),改完 skill 立即生效。**不要为了某次会话临时调整规则**(失忆;下次又恢复了)。
-
----
-
-## 2. dotnet format 能搞 vs 不能搞(分工)
-
-```
-✅ dotnet format 已经处理(主流程 1-5 节)
-- 空白、缩进、行尾
-- 操作符两侧空格、{ } 位置
-- using 排序(IDE0065)
-- file-scoped namespace、表达式 body 等 IDE 规则
-- naming rule(如果 .editorconfig 里配了 dotnet_naming_rule.* —— 90% 项目没配)
-
-❌ dotnet format 处理不了(本节做合规审计)
-- 自定义后缀:Attribute / Exception / Tests / Command 必须以特定后缀结尾
-- "Cmd 缩写禁用" 这种项目级字符串禁令
-- "所有标识符必须用英文"
-- 控件名前缀(lbl/txt/btn 等)命名约定
-- 私有字段 _ 前缀(.editorconfig 可配但通常没配)
-- 方法名动宾短语(语义)
-- 模块头注释 / 公有 API 的 <summary> 注释覆盖率
-- 禁止 enum.ToString() / 禁止匿名委托 / 禁止 if 不加 { } / 禁止浮点 == 等"写法禁令"
-- 类内成员顺序(字段/属性/构造/方法)
-- 反义词组配对(add/remove, open/close)
+```powershell
+dotnet msbuild '<实际.csproj路径>' -getItem:Compile
 ```
 
----
+多目标/多配置项目需使用与本次格式化一致的 `Configuration`、`TargetFramework` 等属性；解决方案先确定成员工程，再分别求值并去重。此命令不运行构建目标，因此不能保证列出构建期间动态添加的项；自定义 target、源码生成与还原失败仍需说明。不能仅因为某文件在同一目录，就把它写进该项目的检查清单。
 
-## 3. Grep-able 检查(机械,能精确定位)
+### 文本候选规则
 
-**强烈推荐: 跑 skill 自带脚本一把抓所有候选**:
+所有规则都需要真实代码上下文确认，过滤只减少明显误报。
 
-```bash
-python ~/.claude/skills/format-csharp/scripts/compliance-grep.py --scope <目录|.csproj|.sln|.cs>
-# 默认输出 $TEMP/compliance-audit.json
-# 里面是 12 条规则的 violations(已应用确定性过滤)+ 每条的 filter_hint
-
-# 实施过修改时的交付复查:只查本次触及的 .cs,再打开注释相关候选确认上下文
-python ~/.claude/skills/format-csharp/scripts/compliance-grep.py --scope <scope> --include-from <changed-cs-files.txt> --quiet
-```
-
-默认两条腿流程或本次包含注释合规时，真实 `summary_inline` 和 `comment_terminal_period` 违规必须清零。脚本只辅助检查标签布局与常见注释形态，不能替代 Section 4 的内容语义检查，也不能完整理解 C# 注释边界或英文点号语义；交付前还要逐条阅读本次新增或改写的注释。用户若明确只做阶段 A/排除注释变更，只确保本次 diff 没有新增或改坏注释，存量候选单独报告、不擅自扩大修改范围。
-
-JSON 结构:
-```json
-{
-  "scope": "...",
-  "scanned_files": 27,
-  "rules": [
-    {
-      "key": "cmd_suffix",
-      "name": "Cmd 后缀禁用",
-      "rule_source": "良好习惯表: ...",
-      "filter_hint": "无需过滤,全部是违规",
-      "pattern": "\\b\\w+Cmd\\b\\s*(\\{|=>|;)",
-      "candidate_count": 72,
-      "candidates": [ { "file": "...", "line": 23, "text": "..." }, ... ]
-    },
-    ...
-  ]
-}
-```
-
-**LLM 拿到 JSON 后干啥:** 对每条规则 (1) 读 `filter_hint` 知道哪些是误判要丢、(2) 应用过滤、(3) 对剩下的"真违规"必要时开文件读上下文确认(尤其是 `enum.ToString()` 以及可能位于块注释/多行字符串内的注释形状候选)、(4) 写最终审计报告(按 Section 5 格式)。
-
-**脚本里覆盖的 12 条规则**(模式和 filter_hint 的权威定义在 `scripts/compliance-grep.py` 的 `RULES` 数组里。要看具体某条规则的 regex 或 filter 文案,直接 Read 那个脚本):
-
-| key | 名称 | 命中即违规? |
+| key | 检查内容 | 必须确认 |
 |---|---|---|
-| `cmd_suffix` | Cmd 缩写禁用 (应改 Command) | ✅ 是 |
-| `attribute_no_suffix` | 自定义 Attribute 缺 Attribute 后缀 | 需过滤 |
-| `exception_no_suffix` | 自定义 Exception 缺 Exception 后缀 | 需过滤 |
-| `interface_no_i_prefix` | 接口缺 `I` 前缀 | 需过滤 |
-| `chinese_identifier` | 标识符含中文(字符串/注释里的中文允许,只查标识符位置) | ✅ 是 |
-| `private_field_no_underscore` | 私有字段缺 `_` 前缀 | 需过滤 |
-| `anonymous_delegate` | 匿名 delegate | ✅ 是 |
-| `no_braces_on_control_flow` | if/for/while 单语句不加 `{ }` | 需过滤(误中 inline return/throw) |
-| `float_equality` | 浮点 `==` / `!=` 直接比较 | 需过滤(== null 合法) |
-| `enum_tostring_suspect` | `enum.ToString()` 嫌疑(误判极多) | **必须读上下文**判断左侧类型 |
-| `summary_inline` | `<summary>` / `</summary>` 未独占行 | 需打开上下文排除块注释/多行字符串；真实文档注释命中即违规 |
-| `comment_terminal_period` | 注释内容以句号结尾候选 | 必须读上下文确认注释边界及英文点号语义；真实句末句号才是违规 |
+| `cmd_suffix` | 命令属性的 Cmd 后缀 | 必须是绑定命令属性，不是普通局部变量、外部 API 或字符串 |
+| `attribute_no_suffix` | Attribute 派生类型后缀 | 真实基类与声明，排除注释/字符串 |
+| `exception_no_suffix` | Exception 派生类型后缀 | 真实继承与外部契约 |
+| `interface_no_i_prefix` | 接口 I 前缀 | 真实接口声明，检查名称冲突 |
+| `chinese_identifier` | 常见声明位置的中文标识符 | 不是字符串或注释；正则不覆盖所有标识符位置 |
+| `private_field_no_underscore` | 私有字段下划线 | const 使用 PascalCase，readonly 仍是字段；排除方法、属性、事件及生成器约定 |
+| `anonymous_delegate` | 匿名 delegate | 仅列结构调整建议，检查闭包、实例与委托相等性，不自动提取 |
+| `no_braces_on_control_flow` | 同行单语句缺大括号 | return/throw/break/continue/yield 也不豁免；多行控制体需要人工检查 |
+| `float_equality` | 同行浮点比较嫌疑 | 类型、业务契约；不能自动换 epsilon，跨行/变量比较仍需读代码 |
+| `enum_tostring_suspect` | 无参 ToString 调用 | 是否枚举、是否用于稳定协议/存储字段；非 enum 不适用 |
+| `summary_inline` | summary 标签未独占行 | 真正的 `///` 文档注释；raw/verbatim string 中相同文字不修改 |
+| `comment_terminal_period` | 常见注释形状句尾句号 | 真实注释、英文点号语义、XML 结束标签前的文本 |
 
-`summary_inline` 的正则已限定为行首 `///` 并排除 `////`，不会误中普通单行注释或单行字符串。但纯 grep 不理解 C# 词法状态：块注释、逐字字符串或 raw string 内若恰好有同样的行首文字，仍会成为候选。打开命中位置确认即可，不要为此自制不完整的 C# 词法器；若未来需要机器强制，应改用 Roslyn syntax trivia。
+`summary_inline` 不验证 XML 是否完整，也不审查内容；`comment_terminal_period` 不能完整识别多行块注释中无星号的正文或所有嵌套标签。真实块注释正文也适用句尾规则，不能全部排除。需要机器强制门禁时应使用成熟的 Roslyn syntax trivia/analyzer；当前正则不冒充 C# 词法器。
 
-`comment_terminal_period` 检查常见的独占行 / 行尾 `//`、`///`、`/* ... */`、块注释星号行，以及句号后紧跟 XML 结束标签的情况；英文省略号 `...` 会过滤。没有注释标记的块注释正文行仍可能漏检，必须由最终 diff 复查。版本号、小数、IP、URL、路径、文件名、类型名或缩写中的点不是句末句号。候选必须打开上下文，排除多行字符串中的同形文字，并确认 ASCII `.` 的语义。
+### 可选语法注释检查
 
-**Backing field 豁免**:`private int _no;` 这种属性的 backing field 如果放在 `[Properties]` region 内(紧贴它的属性),脚本会自动识别为 backing field,**不算 `[Private Fields]` 的成员、不破坏顺序、和属性之间不强制空行**。规则详见 `代码规范.md` "代码布局"章节。脚本**不主动检查** "`_no` 应该挪到 [Properties]" —— 在 `[Private Fields]` 里的 `_xxx` 字段位置是合法的,只是规范**推荐**把它放属性旁边。LLM 别擅自给用户报这种"未触发的建议"。
+当文本形状误报较多、需要真实注释/XML 标签定位时，可使用包内 `scripts/comment-syntax.py`，先读 [依赖、参数与结果约定](comment-syntax.md)。它通过本机稳定 .NET SDK 的 Roslyn 解析，不执行受审项目；需要显式获准的产物目录，并有构建开销。它不替代其余十条文本规则、布局检查或 summary 职责判断。
 
-**类内布局规则用第二个脚本** `scripts/class-layout-check.py` 跑(需要 class body 解析,纯 grep 不够):
+`summary_inline` 的 `syntax_layout_violation` 表示真实文档标签不满足独占物理 `///` 行；句号仍为 `candidate`，包含真实 CDATA 尾界前的字面句号，但不做完整 XML 正文或实体解码分析。退出 `0` 仅表示选定活动语法扫描完成，可能有命中；`3` 表示解析诊断或未检查分支，`2` 表示执行失败，都不能当作零问题通过。原正则 CLI 保持可用，工具失败不自动降级后宣称成功。
 
-```bash
-python ~/.claude/skills/format-csharp/scripts/class-layout-check.py --scope <目录|.csproj|.sln|.cs>
-# 默认输出 $TEMP/class-layout-audit.json
-# 检查 5 条子规则:
-#   members_out_of_order        - 成员顺序错(非 私有字段→属性→事件→构造→公有方法→私有方法)
-#   region_missing               - 某分组 2+ 成员但没 #region [GroupName] / #endregion 包裹
-#   region_no_blank_between      - #endregion 和下一个 #region 之间缺空行
-#   members_no_blank_line        - 同一分组内连续两个方法/属性/事件之间缺空行
-#   summary_missing_on_public    - public 类/方法/属性/事件缺 /// <summary> 文档注释
-```
+### 类内布局候选
 
-**class-layout 的 6 个 region 名固定**(见 `代码规范.md`"代码布局"):`[Private Fields]` / `[Properties]` / `[Events]` / `[Constructors]` / `[Public Methods]` / `[Private Methods]`。
+`class-layout-check.py` 是启发式定位器，检查识别到的成员顺序、region 和间隔，并提供有限的 `summary_missing` 候选。读取 `class_layouts` 的成员分组计数与源码对照；没有识别到的成员不视为合规。
 
-**两种免 region 的情况**(脚本已实现,LLM 不主动报):
-- 单成员分组(1 个成员的组不需要 region 包裹)
-- 全类只有一种非空分组(没有别的组要分隔,这一个 region 多余)
+局限包括字符串/注释中的括号、嵌套类型、partial 跨文件、隐式访问修饰符、泛型方法、复杂 attribute、record/primary constructor、条件编译以及同一行多个声明。遇到这些情况回到源码或现有 Roslyn 工具确认，不根据缺失计数强行加 region。
 
-顺序在所有情况下都要保持。
+- 分组顺序以规范的六组为准，不因 ICommand 或 `[RelayCommand]` 自创强制的第七组
+- 单成员组和仅一种分组可省 region，但已有合法 region 不因此成为违规
+- 属性与其 backing field 是一个布局单元；单元之间留空行，字段与对应属性之间不强制空行。不能因组内有 backing field 就豁免整个组
+- 注释覆盖还需读源码：类、接口、方法、属性均检查，不只 public；事件不强制新增 summary。只有 `<remarks>` 不代表已具备 summary；有效继承/引用文档可复用
 
-**脚本局限**(LLM 抽查时心里有数):用正则状态机解析 class body,**不处理 nested class / partial class 的多文件合并 / 多行 attribute 修饰 / 多行 expression body**。规模大的项目跑出来的 findings 用 LLM 抽检几个确认 false positive 率可控,再批量改。
+## 必须阅读判断的规则
 
-**两条 Grep 不好覆盖、要走 Section 4 reading-required 的写法禁令:**
-- 字符串 `+=` 循环拼接(在 for/while body 内),需 multiline scan
-- for 循环体内修改循环变量,只能读
-
-**控件前缀对照表**(以 `代码规范.md` "控件名缩写示例" 为准,审计控件命名时需要):
-
-```
-lbl=Label  txt=TextBox  tbk=TextBlock  btn=Button  chk=CheckBox  lst=ListBox
-cmb=ComboBox  dtp=DateTimePicker  llb=LinkLabel  lvw=ListView  nud=NumericUpDown
-prg=ProgressBar  rdo=RadioButton  rtx=RichTextBox  tvw=TreeView  grp=GroupBox
-pnl=Panel  spl=GridSplitter  tab=TabControl  spn=StackPanel  cmn=ContextMenu
-mns=MenuStrip  ssr=StatusStrip  tsr=ToolStrip  wbs=WebBrowser  tip=ToolTip
-dpn=DockPanel  ckl=CheckedListBox
-```
-
-> **如果脚本不可用** —— 罕见情况(Python 没装或被禁)。打开 `scripts/compliance-grep.py` 拿 `RULES` 数组里每条的 `pattern` 字段,用 Grep 工具手工逐条跑;然后照每条的 `filter_hint` 在 LLM 里过滤。流程一样,只是没有合并的 JSON 输出。
->
-> **关于 lookaround**:ripgrep 默认编译不带 PCRE2,**不支持 `(?<!...)` / `(?!...)`** —— 这种模式会静默返 0 命中。脚本里所有规则都用宽 grep + filter 两步走避开这个坑;手工跑也要遵守。
-
----
-
-## 4. Reading-required 检查(语义,Grep 抓不准)
-
-下面这些必须打开文件读判断,LLM 直接看代码:
-
-| 规则 | 规范出处 | 检查方式 |
-|---|---|---|
-| 方法名是不是动宾短语 | 良好习惯表(`方法的命名,一般将其命名为动宾短语,如 ShowDialog/CreateFile`) | 列项目所有 `public/internal` method 签名,过滤 `Is*/Has*/Can*/Should*`(谓语 OK)、`To*/From*`(转换 OK)、`Get*/Set*/Update*/Create*/Delete*` 这类常见动词 OK。**剩下纯名词命名的方法**(如 `User()`、`Order()`、`Customer()`)就是不合规 |
-| ~~`<summary>` 注释覆盖率~~ | ~~方法注释规范 1+3~~ | **✅ 已脚本化** —— 见 `class-layout-check.py` 的 `summary_missing_on_public` 子规则(自动检查 public 类/方法/属性/事件,跳过 attribute decoration) |
-| `<summary>` 内容是否只写“是什么 / 做什么” | 代码注释约定 1 + 方法注释规范 10 | 逐条读取 `<summary>`、所属声明和必要的实现上下文。类 / 接口应概括核心职责，方法 / 函数应概括目的或结果，属性应概括值或状态；默认一个简短内容行。用“只改变内部调用、顺序或线程策略而职责不变时，注释是否仍成立”判断是否混入实现细节。该规则不能靠长度或关键词正则判定；默认跳过的遗留模块头模板不在检查范围内 |
-| 模块头注释(功能/作者/日期) | 模块头部注释规范 | 读 .cs 文件头 15 行,看有没有规范要求的 `/// <summary>` 模板字段(功能/完成日期/作者)。**⚠️ 默认跳过这条** —— 这是 .NET Framework 时代的遗留规范,现代 C# 项目(尤其用 file-scoped namespace 之后)几乎从不写模块头注释,跑全量审计大概率每个文件都报、刷屏。**只在用户明确说"按模块头规范查一下"时才跑**,平时静默 |
-| 类内成员顺序 | 代码布局 1(`类内部的代码布局顺序:数据成员、属性、构造函数(、事件)、方法`) | 读类体,按出现顺序提取每个成员的 kind(field / property / ctor / event / method),看是否符合顺序 |
-| 局部变量名意义 | 良好习惯表(`局部变量的名称要有意义。不要用 x,y,z 等等(除用于 For 循环变量中可使用 i,j,k,l,m,n)`) | 读 `var x = ` / `int tmp = ` / `string s = ` 等声明,判断是不是 `x/y/z/tmp/s/a/b/c/data/foo/bar` 这类无意义名;`for` 循环里的 `i/j/k/l/m/n` 允许 |
-| 反义词组配对 | 良好习惯表(`用正确的反义词组命名具有互斥意义的变量或相反动作的函数等`) + 反义词组示例 | **只查"明确成对的动词":`Start*/Stop*`、`Open*/Close*`、`Begin*/End*`、`Lock*/Unlock*`、`Acquire*/Release*`、`Subscribe*/Unsubscribe*`、`Connect*/Disconnect*`、`Show*/Hide*`、`Enable*/Disable*`、`Mount*/Unmount*`**。出现一边就找另一边。**不查 `Add*/Remove*` `Get*/Set*` `Create*/Delete*` 这种** —— 这些动词常单独存在(`AddItem()` 不必有 `RemoveItem()`,会刷大量假违规) |
-| #region 分组使用 | 代码布局 + 良好习惯表(`把相似的内容放在一起...适当地使用 #region…#endregion`) | 读类体,看有没有 #region 分类(数据成员/属性/方法分块) |
-
----
-
-## 5. audit 报告格式(给 SKILL.md Section 7 实施用)
-
-audit 完不是终点,是**通向"按破坏性分批实施"的输入**。报告必须按 🟢/🟡/🔴 分级,因为 Section 7 就是据此挑批的。
-
-**默认审计范围:**
-- 跟在 `dotnet format` 后面跑(两条腿都走) → 默认审计**本次 format 改过的文件**(从 `format-report.json` 取 FilePath 列表),范围小、跑得快
-- 独立跑 audit(用户说"只审计先别动" / "只做语义流") → 默认审计**用户指定的 sln/csproj/目录**,没指定就反问。**不要默认扫全项目** —— 大项目几千个 .cs 跑全量 grep 慢且报告淹没
-
-**报告范例(Section 6 已经规定的格式,这里展开一条具体规则的写法):**
-
-```
-## 🔍 合规审计 — <scope>(用户给的目录 / .csproj / .sln)
-
-📊 总览: 261 处违规分布在 27 个文件
-  🟢 低破坏性: 177 处 (134 私有字段 + 43 单语句无大括号)
-  🟡 中破坏性: 84 处 (72 Cmd → Command + 12 enum.ToString())
-  🔴 高破坏性: 0 处 (本次无 public API / 中文标识符违规)
-  ℹ️ 规则冲突: 0 处
-
-### 🟢 低破坏性详单
-
-#### 私有字段缺 `_` 前缀 (134 处, 规范:大小写表 + 良好习惯表)
-- src/ViewModels/DownloaderViewModel.cs L33: `private bool isVisible = false;` → `_isVisible`
-- src/ViewModels/DownloaderViewModel.cs L49: `private int themeType = 1;` → `_themeType`
-- ...(132 条略,完整清单在 $env:TEMP\compliance-audit.json)
-
-#### if/for/while 单语句缺 `{ }` (43 处, 规范:良好习惯表 + 表达式与语句 1)
-- src/ViewModels/LoginViewModel.cs L132: `if (lang.Contains("en")) lang = "en";` → 包成 `{ }`
-- ...
-
-### 🟡 中破坏性详单
-
-#### ICommand 属性 `Cmd` → `Command` (72 处, 规范:良好习惯表 — 禁止 Cmd 缩写)
-
-  ⚠️ 引用扫描:在 .xaml 文件中找到 <X> 处 `{Binding XxxCmd}` 用法,改名时需同步
-    (XAML grep 是审计阶段 LLM 手工跑的 —— compliance-grep.py 只扫 .cs)
-    - src/Views/Login.xaml (<X1> 处)
-    - src/Views/Main.xaml (<X2> 处)
-    - ...
-
-  详单(改名 + 同步 XAML):
-  - src/ViewModels/LoginViewModel.cs L265: `SwitchUICmd` → `SwitchUICommand`
-    XAML 同步: src/Views/Login.xaml L34, L48
-  - ...
-
-#### enum.ToString() 嫌疑 (12 处, 需 LLM 读上下文判断左侧是否枚举)
-- src/Http/Client.cs L34: `httpRequest.Method = HttpMethod.Get.ToString();`
-  - 上下文确认:`HttpMethod` 是 enum ✓
-  - 改法:enum 上加 `[Description("GET")]`,改用 `.GetDescription()` 扩展方法
-  - 影响:本文件 + 需在工程里有 `GetDescription()` 扩展方法 (没有就先问用户在哪建,不默认新建文件)
-- ...
-
-### 🔴 高破坏性详单
-(本次无)
-
-### ℹ️ 规则冲突
-(本次无)
-
-### ✅ 已通过 dotnet format 覆盖
-- using 排序、缩进、空白、行尾、操作符空格(阶段 A 跑完已干净)
-
----
-下一步: SKILL.md Section 7。**默认建议**:
-  🟢 → 一批 apply + 一次 diff 预览 + 一键 OK
-  🟡 → 按规则一组应用(改名 + XAML 同步在同一批,确保 diff 能看到 XAML 也改了),用户挑批
-  🔴 → 逐条:先列引用扫描、再 preview、用户单独 OK
-```
-
-**关于"合规率/百分比":不要造假分母**。如果给比例,得说清楚分母(比如"扫描 5876 个 .cs 文件,17 个有命名违规,占 0.3%")。模糊的"合规率 76%"看起来像数据,实际是凭空数。要么列具体计数,要么不要这一行。
-
-**报告写作要点:**
-- 每条违规给 (a) 文件:行 (b) 违反的规则(引用 `代码规范.md` 具体章节,不要只说"规范说") (c) 建议改法 (d) 破坏性等级(🟢/🟡/🔴)
-- **同一规则在同一文件命中多次,合并展示**:"src/Foo.cs 有 12 处 Cmd 后缀"比 12 条独立强
-- **中/高破坏性必须附引用扫描结果** —— 给 Section 7 实施时的影响面参考
-- **规则冲突单独列**(规范文档 vs .editorconfig 矛盾),不混在违规里 —— 那是用户决策项,不是 fix 项
-
----
-
-## 6. 不该做的事
-
-- **不要把 Grep 命中直接当违规** —— 必须开文件确认上下文。`\.ToString\(\)` 经常误中 `int.ToString()` 等合法用法；行首注释形状的文字也可能位于块注释或多行字符串内。脚本已过滤确定性误判，但 `enum_tostring_suspect`、`summary_inline` 和 `comment_terminal_period` 的这类候选**必须 LLM 读上下文**。
-- **不要为了刷违规数把同一规则在同一文件里拆成几十条** —— 合并展示。
-- **不要修改 `代码规范.md` 这份内嵌文档** —— 即使发现规范有自相矛盾、有打字错、有过时信息,在报告"规则冲突"那一节**指出**,但**不替用户改**。规范变动是用户决策。如果用户明确说"改一下规范文档加一条新规则"那是另一种意图,可以改,但要先确认。
-- **不要试图替 LLM 跑 Roslyn 分析器** —— StyleCop / SonarAnalyzer / 自定义 analyzer 这些属于 `dotnet format analyzers` 子命令范畴。本文是这些 analyzer 之外、需要 LLM 语义判断或字符串模式匹配的部分。
-- **不要去搜用户项目里的 `代码规范.md` 或类似文件作为额外规则源** —— 规则唯一来源是本目录的 `代码规范.md`。项目里有同名文件也忽略。如果用户希望用项目里的版本,告诉他把内容复制覆盖到 `~/.claude/skills/format-csharp/references/代码规范.md`。
-- **不要在 audit 阶段就动文件** —— audit 只产出报告;实施在 SKILL.md Section 7 做(分批 + diff 预览 + 用户挑批 + build 验证)。
-- **不要把"按规范统一改名"推给 code-refactor** —— 这是 format-csharp 的核心 use case。code-refactor 是处理 "structural"(提取方法、拆大类、改算法、合并重复逻辑)的,不是 "surface" 改名/重排/补注释。详见 SKILL.md Section 0 的边界说明。
-
----
-
-## 附录:dotnet format 子命令
-
-`dotnet format` 内部有 3 个子命令,默认全跑。用户明确说"只做某一类"时按需选:
-
-| 子命令 | 作用 |
+| 检查 | 判断依据 |
 |---|---|
-| `dotnet format whitespace <target>` | 只调缩进、行尾、空格 |
-| `dotnet format style <target>` | 跑 IDE/style 规则(命名、using 排序、表达式 body 等) |
-| `dotnet format analyzers <target>` | 跑第三方 analyzer 修复(StyleCop / SonarAnalyzer 等) |
+| summary 内容 | 与所属声明同一抽象层级，只描述职责/目的/值；不能以字数或关键词自动判过度 |
+| 文档契约 | 参数名、返回值、异常与实际签名/行为一致；不删掉调用方需要的信息来缩短 summary |
+| 命名清晰 | 结合领域判断，不用禁词表把所有 `data`、`x` 或名词方法都当违规，谓词/转换方法是正常命名 |
+| 相反动作 | 只在代码确实表达同一对相反动作时检查用词一致，不要求出现 Open 就必须实现 Close |
+| 字符串拼接 | 先看循环规模、分配和中途观察值，作为优化建议，不直接替换 StringBuilder |
+| 循环变量 | 读循环不变量、退出条件与业务含义；修改控制变量是审查信号，不直接删赋值 |
+| 布局行为 | 字段/自动属性初始化顺序、StructLayout、条件编译、文档和 attribute 附着关系 |
 
-用户原话举例:
-- "只修缩进别动 using 顺序" → `dotnet format whitespace`
-- "只跑 analyzer 修复" → `dotnet format analyzers`
-- 默认/不确定 → 不指定子命令(全跑)
+## 修复要点
 
----
+### 规范驱动改名
 
-## 7. Per-rule 修复细则(SKILL.md Section 7 实施细则展开)
+先定位声明及所有 partial 部分，检查语义引用以及 XAML/AXAML/Razor/JSON/配置/resx、反射、序列化、`nameof`、源生成器和外部消费方。私有字段也可能通过反射或序列化被访问；public 名称可能是公开契约。引用必须按符号归属修改，不能全局字符串替换同名但不同含义的符号。
 
-每条规则具体怎么改 —— grep 哪些引用、补哪些 using、何时反问用户。**每个修复都通过 SKILL.md Section 7 的"分批 + diff 预览 + 用户挑批 + build 验证"流程,这里只讲单条规则的具体动作**。
+- 命令属性 `UseCmd → UseCommand` 时验证绑定；对于 `[RelayCommand]`、`[ObservableProperty]` 先确认生成规则，防止生成 `CommandCommand` 或改变依赖属性名
+- Attribute 同步类型、构造函数与标注用法，短写形式需核对命名空间/别名冲突，不假定 `[Author]` 一定解析到新类型
+- Exception 检查所有类型引用，不只 throw/catch；接口名称检查实现类、泛型约束、DI 注册与配置
+- 中文改英文时上下文明确或用户委托命名可给出合理译名并实施；有业务歧义或外部契约需先澄清，不逐个询问显而易见的局部变量
 
-### 命名后缀类
+### 注释整理
 
-- **`UseCmd` → `UseCommand`**(`cmd_suffix`):
-  1. `Edit` 改 ViewModel/相关 .cs 里的属性声明
-  2. `Grep` `XxxCmd` in `*.xaml *.axaml *.razor *.cshtml` 找 binding 引用
-  3. `Edit` 同步所有 XAML binding(`{Binding XxxCmd}` → `{Binding XxxCommand}`)
-  4. **diff 预览要能看到 .cs 改动 + .xaml 改动都在**
-  5. `dotnet build` 验证
+仅换行任务保留正文；明确包含内容/标点规范时一起修。summary 默认一个简短内容行，`StartServices → 开启服务`、`InitializeAsync → 异步初始化`、`ClearServices → 清理服务`、`InitializationTask → 初始化任务`。实现细节按需放在对应逻辑附近，不把每条删掉的描述重新变成行注释。
 
-- **`AuthorAttr` → `AuthorAttribute`**(`attribute_no_suffix`):
-  1. `Edit` 改类声明 + 同文件内构造函数引用(`AuthorAttr(...)`)
-  2. `Grep` `[AuthorAttr` in `*.cs` 找标注用法
-  3. `Edit` 同步所有 `[AuthorAttr(...)]` → `[Author(...)]`(注意:C# attribute 用法时会自动补 `Attribute` 后缀,所以代码里写 `[Author]`,真实类名是 `AuthorAttribute`)
-  4. `dotnet build` 验证
+所有注释结尾省略句末 `。` / `.`；`1.2`、`0.5`、URL、文件名、成员名、缩写、`...` 保留。检查 XML 结束标签前的正文与块注释，不修改字符串字面量、编译器/工具指令或必须原样保留的生成/法律文本。
 
-- **`AppExc` → `AppException`**(`exception_no_suffix`):同 Attribute 流程,但 grep 用法是 `throw new XxxExc(` 和 `catch (XxxExc`
+缩短 summary 不删除仍有效的参考链接；需要时移到同一声明的 `<remarks>`。有 HTTP(S) 链接的修改可使用已记录的本次基线副本对比，不能拿含用户未提交改动之前的 Git 版本冒充基线：
 
-- **`Foo` → `IFoo`**(`interface_no_i_prefix`):
-  1. `Edit` 改 interface 声明
-  2. `Grep` 整个工程找用法(`Foo foo;` `: Foo` `where T : Foo` 等)
-  3. `Edit` 同步所有引用
-  4. **注意**:可能有命名冲突 —— 项目里已经有 `IFoo` interface,这种情况要先反问用户改成什么名
-
-### 标识符语言类
-
-- **中文标识符 → 英文**(`chinese_identifier`):
-  1. **先反问用户目标命名** —— `用户信息` → `UserProfile` / `UserInfo` / `UserDetail`? 是语义判断,不能自己拍板
-  2. 用户拍板后,`Edit` 改声明
-  3. `Grep` 全工程(`*.cs *.xaml *.json *.resx *.config`)找所有出现的中文名
-  4. `Edit` 同步所有引用
-  5. **如果是文件名也含中文**:重命名文件(`git mv 用户信息.cs UserProfile.cs`),`.csproj` 里如果显式列了文件路径(老项目)也得改
-  6. `dotnet build` 验证
-
-### 私有字段前缀类
-
-- **`isVisible` → `_isVisible`**(`private_field_no_underscore`):
-  1. `Edit` 改字段声明
-  2. `Grep` 同文件内的引用(私有字段只在同 class 内,范围小)
-  3. `Edit` 同步引用点
-  4. **特别注意**:`this.isVisible` → `this._isVisible`,`OnPropertyChanged(nameof(isVisible))` → `nameof(_isVisible)`(WPF/MVVM 项目要小心 `nameof` 引用,虽然属性名不变但绑定字段名变了)
-  5. `dotnet build` 验证
-
-### 注释类
-
-- **加 `<summary>` 注释**:
-  - 默认只写一个简短中文内容行，并与声明保持同一抽象层级：类 / 接口概括核心职责，方法 / 函数概括目的或结果，属性概括值或状态；默认跳过的遗留模块头模板不在此列
-  - 名称已清楚时直接翻成简短中文短语即可，例如 `StartServices` → “开启服务”、`InitializeAsync` → “异步初始化”、`ClearServices` → “清理服务”、`InitializationTask` → “初始化任务”；不要为了显得“有信息量”而扩写内部步骤
-  - 不在 `<summary>` 中枚举协作者、调用顺序、订阅方式、后台 / 线程策略、回滚恢复过程或资源释放细节。必要且不显然的实现说明放在对应逻辑附近；参数、返回值、异常和补充契约分别使用 `<param>`、`<returns>`、`<exception>`、`<remarks>`
-  - 用“内部实现变化而职责不变时，注释是否仍然成立”做复查。写不出准确职责时就在报告里标“建议手工补”，不凑数写“处理相关逻辑”等废话
-  - 所有新增或改写的注释内容结尾省略中文句号 `。` 和英文句号 `.`；内联 XML 标签在结束标签前去掉句号，版本号、小数、URL 等内部点号保持不变
-
-- **`<summary>` 单行 → 多行**(`summary_inline`):
-  把 `/// <summary>内容</summary>` 拆成三行:
-  ```
-  // 之前
-  /// <summary>处理订单付款</summary>
-  // 之后
-  /// <summary>
-  /// 处理订单付款
-  /// </summary>
-  ```
-  纯布局批次**保留原文不动，只调布局**；若原文还违反“只写做什么”规则，把它作为单独的 reading-required 内容问题列入预览，不在未获确认时顺手改写。其他 XML 文档标签(`<param>` / `<returns>` 等)单行允许,只 `<summary>` 必须多行。新增或改写 `<summary>` 时也直接使用多行布局，不得先产生单行形式。
-
-- **注释句号结尾 → 省略句号**(`comment_terminal_period`):
-  - `/// 开启服务。` → `/// 开启服务`
-  - `/// <param name="bootstrap">设备引导程序.</param>` → `/// <param name="bootstrap">设备引导程序</param>`
-  - `// 回滚目录切换。` → `// 回滚目录切换`
-  - 只删除作为句末标点的句号，不删除 `1.2`、`0.5`、IP、URL、路径、文件名、成员名、缩写或省略号中的点；脚本遗漏的块注释正文行要在 diff 中人工检查
-
-### 类内归类
-
-- **重排类成员**(规范要求顺序:字段 → 属性 → 构造 → 事件 → 方法):
-  1. 读类体,用 Roslyn 语法理解或者手工识别每个成员的 kind
-  2. `Edit` 重写整个类体,按顺序重排
-  3. **更稳的方式**:把成员按类型分组用 `#region` 包起来,既符合规范又减少 diff 噪声
-  4. `dotnet build` 验证
-
-### 写法禁令类
-
-- **匿名 delegate → 具名方法**(`anonymous_delegate`):
-  1. 在同 class 内加 `private void OnFooHappened(object s, EventArgs e) { ... }` 等具名方法,函数体复制自原匿名 delegate
-  2. `Edit` 把 `EventHandler handler = delegate (object s, EventArgs e) { ... };` → `EventHandler handler = OnFooHappened;`
-  3. `dotnet build` 验证
-
-- **if/for/while 加大括号**(`no_braces_on_control_flow`):
-  1. `Edit` 把 `if (cond) doX();` → `if (cond) { doX(); }`
-  2. 多行版:
-     ```
-     if (cond) { 
-         doX();
-     }
-     ```
-  3. 这条没有引用问题,改完直接 build 验证
-
-- **浮点 `==` → epsilon**(`float_equality`):
-  1. `Edit` 把 `if (x == 0)` → `if (Math.Abs(x) < 1e-9)`(epsilon 值看精度需求选,常见 `1e-9` / `1e-6` / `float.Epsilon`)
-  2. 反向:`!=` 改 `>=`
-  3. `dotnet build` 验证
-
-- **`enum.ToString()` → `[Description]+.GetDescription()`**(`enum_tostring_suspect`):
-  1. **先 LLM 读上下文确认**左侧确实是 enum(不是 int/DateTime/etc)
-  2. **再 grep 项目里有没有 `GetDescription()` 扩展方法**:`Grep("public static.*GetDescription\(this Enum")`
-  3. 有的话:`Edit` enum 加 `[Description("XXX")]` 标注,`Edit` 调用点 `.ToString()` → `.GetDescription()`,文件头加 `using System.ComponentModel;`
-  4. **没有的话不要默认新建文件** —— 新建 `EnumExtensions.cs` 跨进 structural 范畴。**先反问用户**:"项目里没找到 `GetDescription` 扩展方法,要加到现有 Utilities 类、还是新建 EnumExtensions.cs?" 等用户拍板再动
-  5. `dotnet build` 验证
-
-- **字符串 `+=` → StringBuilder**(读判定,需 LLM 看上下文):
-  1. 确认 `+=` 在循环体内
-  2. `Edit` 在循环前加 `var sb = new StringBuilder();`
-  3. `Edit` 循环内 `str += x` → `sb.Append(x)`
-  4. `Edit` 循环后 `var str = sb.ToString();`
-  5. 文件头加 `using System.Text;`
-  6. `dotnet build` 验证
-
----
-
-## 8. 全流程终极汇总 mock 范例
-
-阶段 A + B 都跑完后给用户的合并报告范例:
-
-```
-✅ 代码风格清理完成
-
-阶段 A (dotnet format 机械流): 改了 27 个文件
-  - 主要修了: 缩进、using 排序、操作符空格
-
-阶段 B (合规审计 + 实施): 改了 22 个文件,261 处违规
-  🟢 私有字段加 _ 前缀                134 处
-  🟢 if/for/while 加大括号             43 处
-  🟡 ICommand 属性 Cmd → Command      72 处 (含 XAML binding 同步 53 处)
-  🟡 enum.ToString() → [Description]  12 处
-
-跳过未改:
-  - 模块头注释规则 (默认 skip,现代项目不需要)
-  - 规则冲突 1 处 (规范说 Tab,.editorconfig 说 space —— 待你拍板)
-
-summary 布局与内容、注释结尾复查: ✅ 已确认无真违规
-dotnet build: ✅ 通过
-单元测试: ✅ 通过 (跑了 137 个测试,全过)
-
-下一步建议: 检查一下 git diff --stat,觉得 OK 就 commit
-  (一般建议拆 2-3 个 commit:1 个 dotnet format 改动 + 1-2 个语义改动批次,
-   方便 code review 时分开看)
+```text
+python -B <skill-root>/scripts/check-doc-preservation.py --before <基线.cs> --after <改后.cs> --json
 ```
 
-**报告原则**:
-- 数据**用真实跑出来的数字**,不要凭空写(范例里的具体数 27/134/43/72/12/53 等只是示意 —— LLM 实际跑完后填脚本输出的真实计数)
-- 不替用户 commit —— 让他自己看完最终 working tree 再决定怎么拆分
+脚本只读两个不同的 `.cs` 文件，输出 stdout，不创建报告或访问网络。要求 Python 3.10+；编码与审计脚本相同，空基线、读入失败、同一文件等返回 `2`。正常比较时 `1` 表示 URL 丢失或标点变化候选待复核；`0` 仅表示这一有限比较未发现候选，`no_baseline_url_candidates` 明确表示没有基线 URL，**均不表示注释完整或合规**。
+
+它比较行首 `//`、`/*`、`*` 形状中的 HTTP(S) URL 集合；同 URL 移入 remarks 或减少重复次数不算丢失。候选起点只识别原文字面的 `http://` / `https://`（忽略大小写），识别后才解码 token 内的完整 XML 实体；编码后的 scheme（如 `https&#58;//`）不覆盖，query/fragment 保留。引号内 URL 精确保留尾部标点，裸 URL 的可能句末标点发生变化时单列复核，避免把合法 URL 尾点当句号自动删掉。JSON 含改前/改后位置与原 token，复核真实上下文后再决定是否恢复。
+
+这不是 C# 词法器：raw/verbatim 字符串中的相同形状也可能命中，行尾注释、无星号块注释续行、跨行 URL、非 HTTP 链接、`cref`/`include`、版本和文字契约未覆盖；按文件去重不能证明 URL 仍附着原声明。不能根据退出码自动修改、把候选说成确定违规，或用该脚本替代声明与 diff 复核。
+
+### 大括号与成员顺序
+
+根据 C# 语法识别完整控制体，包括嵌套 if/else，保留绑定关系和局部作用域；不能通过正则在第一个分号处简单包裹。重排仅移动完整成员及其附属文档/attribute，保留初始化器相对顺序；遇到结构布局、条件编译或副作用时优先仅调整 region/空行，无法证明安全的移动不实施。
+
+### 不自动执行的语义调整
+
+- 浮点 `==` / `!=` 可能正用于哨兵、精确结果、Infinity 或 NaN 语义；容差取决于领域、绝对/相对误差与尺度。`float.Epsilon` 不是通用比较容差，格式化任务不得任设 `1e-9`
+- 枚举 `ToString()` 在日志等场景可合理使用。协议字段需要稳定映射，但 `Description`、Flags、未知值、数字回退及本地化会改变输出；先确定现有契约，不能默认加注解/扩展方法
+- 匿名委托提取会改变闭包、捕获时机和委托身份；StringBuilder 可能改变 null、格式化/重载、求值顺序与中间状态。列出证据和建议，只有用户授权相应重构后才实施
+
+## 验证与报告
+
+报告使用实际文件与行号、规范章节、候选确认依据、影响面和建议。分清：已完成的安全整理、待确认候选、已确认但超出本次授权的风险项、规则冲突、工具/范围限制。按规则与文件合并重复项，不编造合规率或性能数据。
+
+比较本次基线与最终 diff，确认没有无关文件、字符串或行为变化；按风险执行格式复验、相关项目构建与定向测试。注释任务需人工复核内容/布局/句尾，构建通过不能替代这一检查。只读审计不自动进入修复阶段，修改任务则不因“审计结束”无故停下。
+
+保留同一份基线/改后验证依据，区分测试装置失败与代码回归。验证完成且相关输入未变时不重复执行或追求启发式候选归零；临时报告和夹具的清理不阻塞交付，被策略拒绝后不换方式继续清理。

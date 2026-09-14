@@ -1,56 +1,77 @@
 #!/usr/bin/env python3
-# Requires: Python 3.10+ (uses PEP 604 `X | None` type unions)
-"""
-Find the nearest .csproj that contains the given .cs file by walking up
-the directory tree.
+"""List ancestor .csproj candidates for a .cs file; never claim Compile membership.
 
-`dotnet format` cannot operate on a bare .cs file — it needs project context
-(.editorconfig, analyzers, references). When the user gives a single .cs file,
-this script returns the .csproj that should be passed to
-`dotnet format <csproj> --include <cs-file>`.
-
-Exit codes:
-    0  found, .csproj path on stdout
-    1  input path doesn't exist
-    2  no .csproj found in any parent directory
-
-Example:
-    python find-csproj.py path/to/Foo.cs
-    # → path/to/MyApp.csproj
+Exit 0: one unverified candidate. Exit 1: invalid input/read error.
+Exit 2: no ancestor candidates. Exit 3: multiple candidates, selection required.
+Linked files may belong to projects outside the ancestor chain; inspect evaluated
+MSBuild Compile items before formatting. No project is selected arbitrarily.
+Use --search-root to bound discovery to an authorized directory. Omitting it
+preserves the legacy search through all ancestors, up to the filesystem root.
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except (AttributeError, OSError):
+    pass
 
-def find_csproj(cs_file: Path) -> Path | None:
-    """Walk up from cs_file's directory and return the first .csproj found."""
-    start = cs_file.parent if cs_file.is_file() else cs_file
-    for d in [start, *start.parents]:
-        for child in d.iterdir():
-            if child.suffix.lower() == ".csproj":
-                return child
-    return None
+
+def find_candidates(cs_file: Path, search_root: Path | None = None) -> list[Path]:
+    candidates = set()
+    for directory in (cs_file.parent, *cs_file.parent.parents):
+        for child in directory.iterdir():
+            if child.is_file() and child.suffix.casefold() == ".csproj":
+                candidate = child.resolve()
+                if search_root is not None and not candidate.is_relative_to(search_root):
+                    raise ValueError(f"Project candidate resolves outside --search-root: {child}")
+                candidates.add(candidate)
+        if directory == search_root:
+            break
+    return sorted(candidates, key=lambda path: (str(path).casefold(), str(path)))
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
-    p.add_argument("cs_file", help="Path to the .cs file (absolute or relative)")
-    args = p.parse_args()
-
-    cs_file = Path(args.cs_file)
-    if not cs_file.exists():
-        print(f"Path not found: {cs_file}", file=sys.stderr)
+    parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    parser.add_argument("cs_file", help="Existing .cs file")
+    parser.add_argument("--json", action="store_true", help="Emit structured candidates")
+    parser.add_argument("--search-root", help="Authorized ancestor directory (inclusive); "
+                        "default preserves legacy search through all ancestors")
+    args = parser.parse_args()
+    try:
+        path = Path(args.cs_file).resolve(strict=True)
+        if not path.is_file() or path.suffix.casefold() != ".cs":
+            raise ValueError(f"Expected a .cs file: {path}")
+        if args.search_root is not None and not args.search_root.strip():
+            raise ValueError("--search-root must name an existing directory")
+        search_root = (Path(args.search_root).resolve(strict=True)
+                       if args.search_root is not None else None)
+        if search_root is not None:
+            if not search_root.is_dir():
+                raise ValueError(f"--search-root must be a directory: {search_root}")
+            if not path.is_relative_to(search_root):
+                raise ValueError(f"Input file is outside --search-root: {path}")
+        candidates = find_candidates(path, search_root)
+    except (OSError, ValueError) as error:
+        print(error, file=sys.stderr)
         return 1
-
-    csproj = find_csproj(cs_file.resolve())
-    if csproj is None:
-        print(f"No .csproj found in any parent directory of '{cs_file}'", file=sys.stderr)
+    if args.json:
+        print(json.dumps({"file": str(path), "membership_verified": False,
+                          "search_root": str(search_root) if search_root is not None else None,
+                          "candidates": [str(candidate) for candidate in candidates]},
+                         ensure_ascii=False, indent=2))
+    else:
+        for candidate in candidates:
+            print(candidate)
+    print("Candidates only: inspect evaluated Compile items, including Remove/Link "
+          "and conditional items. Linked owners outside ancestor folders are not listed.",
+          file=sys.stderr)
+    if not candidates:
         return 2
-
-    print(csproj)
-    return 0
+    return 0 if len(candidates) == 1 else 3
 
 
 if __name__ == "__main__":

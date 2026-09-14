@@ -3,20 +3,98 @@ name: format-csharp
 description: 格式化、审计和整理现有 C# 代码，统一代码风格、命名、成员布局和注释。保持代码行为不变，不负责新增功能或结构性重构。
 ---
 
-# Format C# Code
+# C# 格式与规范整理
 
-**保持 C# 代码可读性 + 风格统一 —— 不改运行行为,只改"代码长什么样"。** 用户说"格式化/format/按规范跑一遍"通常指这一坨事,包括:空白 / 缩进 / using 排序(机械)、命名 / 类内归类 / 注释 / 写法禁令(语义)。两条腿走路:
+让目标 C# 代码符合约定，同时保持外部行为与用户原有改动。风格规则是审查依据，不是改变程序语义的授权。
 
-**阶段 A. 机械流(`dotnet format`)** —— 空白、缩进、using 排序、大括号位置。Section 1-5 走这条。
-**阶段 B. 语义流(合规审计 + 按破坏性分批实施)** —— 命名、类内归类、`<summary>` 注释、写法禁令(`Cmd`→`Command`、`_` 前缀、`enum.ToString()` 等)。Section 6-8 走这条。
+## 1. 根据请求确定模式
 
-**默认两条腿都跑**。除非用户明确说"只修空白"(只跑 A)、或"只审计先别动"(只跑 B,审计不实施)、或"只改命名"(只跑 B 但跳过 dotnet format)。
+| 请求 | 执行范围 |
+|---|---|
+| 格式化、按规范整理 | 机械格式化 + 目标范围规范审查，实施已授权且确认不改变行为的修改 |
+| 只改空白、缩进 | 仅机械空白格式，不扩展到命名、成员重排或历史注释 |
+| 只审计、先看看问题 | 只读检查并报告，不修改代码、项目配置或技能规则 |
+| 指定命名、注释或布局 | 直接完成指定类别，不强制跑全部格式化 |
+| 拆类、提取方法、消除重复、优化算法 | 属于结构性重构；有可用 `code-refactor` 时使用，否则按普通重构流程处理 |
 
-**不可违反的注释输出约束:**
+明确要求修改就是相应范围的实施授权：先检查并简述影响即可，不重复要求用户逐批点头。仅当新发现外部契约风险、规则冲突或必要选择无法从上下文判断时，暂停受影响的修改并询问；无关的安全工作可以继续。
 
-1. **声明文档注释的内容只写“是什么 / 做什么”，不写“怎么做”**。本规则适用于类 / 接口、方法 / 函数和属性的 `<summary>`；默认跳过的遗留模块头模板不在此列。内容必须与声明保持同一抽象层级：类 / 接口概括核心职责，方法 / 函数概括目的或结果，属性概括所表示的值或状态。默认使用一个简短内容行；名称已经清楚时，直接写对应的简短中文短语即可，不得为了显得“有信息量”而补充内部步骤、协作者、调用顺序、订阅方式、后台 / 线程策略、回滚恢复过程或资源释放细节。只改变内部实现而职责不变时，`<summary>` 应仍然成立。必要且不显然的实现原因、流程或关键步骤放在对应代码逻辑前的普通行注释；调用者需要知道的外部契约按性质写入 `<param>`、`<returns>`、`<exception>` 或 `<remarks>`。
-2. **标签必须物理换行**。无论是新增、改写还是整理现有注释，`<summary>` 和 `</summary>` 都必须各自占一个 `///` 行，内容放在中间的一个或多个 `///` 行。即使内容只有一句，也禁止输出 `/// <summary>内容</summary>`。
-3. **注释内容结尾省略句号**。所有新增或改写的 C# 注释都不得以中文句号 `。` 或英文句号 `.` 结束，包括 XML 文档注释内容、普通 `//` 行注释和块注释；内联 XML 标签中，结束标签前的内容末尾也按此规则处理。只省略作为句末标点的句号，版本号 `1.2`、小数 `0.5`、URL、文件名或成员名内部的点保持不变；省略号 `...` / `……` 不属于本规则所说的句号。
+## 2. 确定范围、规则和基线
+
+1. 使用用户指定的文件、目录、项目或解决方案；上下文明确时不重复问路径。多个候选且无法判定才询问，不任取第一个
+2. 读取目标内适用的仓库指令、`.editorconfig`、`.gitattributes` 和 SDK 配置。规范整理时完整阅读 [代码规范](references/代码规范.md)；运行审计或修改命名、注释、布局时，再完整阅读 [检查与修复指南](references/compliance-check.md)。用户明确选择的规则优先，内嵌规范提供默认约定；项目既有强约束冲突需说明，不偷偷改配置让检查变绿
+3. 用 `git status --short`、相关 diff 或文件副本记录已有改动与本次基线。脏工作区不是自动停工理由，也不要求用户先提交或 stash。没有 git 时使用限定目标的文件备份，仍可完成整理
+4. 排除生成代码、构建产物和第三方目录，保留用户明确指定的例外。项目/解决方案不能用“递归扫描它的父目录”冒充项目成员；核实实际 Compile 项及链接文件，无法确定则明确限制覆盖范围
+5. 脚本相对路径以**当前使用的技能目录**为根，不硬编码 Codex 或 Claude 的安装位置。辅助脚本要求 Python 3.10+；仅在准备使用 .NET 工具时检查 SDK 与 `global.json`，准备运行机械格式化时再检查 `dotnet format --help`。单文件手工整理不必探测未使用的工具
+
+单 `.cs` 文件不能直接作为 `dotnet format` 的 workspace 参数。需要查工程时运行 `python -B <skill-root>/scripts/find-csproj.py <文件> --search-root <已确认的搜索根>`，不越过任务范围向用户目录或磁盘根枚举。邻近关系不证明 Compile 包含关系，链接文件可能属于其他已授权路径的工程。明确是独立片段或范围内无工程时，直接手工整理/审计，不为使用 formatter 虚构项目；确需编译的临时夹具只验证片段，不代表原工程构建通过
+
+已授权的工具命令需要独立日志、超时和进程树收尾时，先读 [有界验证命令](references/verification-runner.md)，使用包内 `scripts/run-verification.py`。运行 .NET 命令选 `--profile dotnet`，环境设置应先于本次首条 SDK/MSBuild/format 命令，而不是看到首次运行提示后才补设。它不提供系统沙箱、不自动还原依赖，也不能代替实际范围核对或用于重试已被策略拒绝的命令。
+
+## 3. 机械格式化
+
+先 dry-run，再按相同范围实施和复验。默认从 `whitespace` 开始，using 等 style 修复需按报告确认诊断适用；不要默认放行任意第三方 analyzer 的修复。用户明确要求全部 analyzer 修复时也要检查行为影响，发现超出格式整理的内容单独报告。
+
+以下为 PowerShell 示例；替换成已核实路径，并在 workspace 所在目录执行。多文件是**多个独立参数**，不是一个含空格的路径字符串：
+
+```powershell
+$formatTarget = 'E:\Project\App.csproj'
+$formatFiles = @('E:\Project\src\One.cs', 'E:\Project\src\Folder With Space\Two.cs')
+$formatScratchRoot = 'E:\Project\.task-artifacts' # 替换为本次已授权的写入位置
+$formatReportDir = Join-Path $formatScratchRoot ('csharp-format-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $formatReportDir | Out-Null
+dotnet format whitespace $formatTarget --include @formatFiles --verify-no-changes --report $formatReportDir --verbosity minimal
+$formatExit = $LASTEXITCODE
+```
+
+针对整个目标省略 `--include`；排除列表同样分参数传入，不假定当前 SDK 支持 glob。实际选中范围要与报告相核对。
+
+- 使用独立临时报告目录，避免读取旧报告或并发覆盖。查看当前 SDK 实际生成的 JSON 路径，显式传给 `scripts/summarize-format-report.py --path <报告> --json`
+- 非零退出码可能是格式差异，也可能是 SDK、还原、workspace 加载或执行失败；结合诊断日志与有效报告区分，**缺报告/空白文件不等于没有问题**
+- `--no-restore` 仅在所需还原状态已具备时使用，不为格式化擅自升级依赖、SDK 或项目配置。离线环境不能还原时，报告限制并继续可行的只读/手动检查
+- 对需要修复的 style 诊断使用当前 SDK 支持的 `dotnet format style` 与 `--diagnostics` 限定；`--severity` 是诊断筛选阈值，不是退出码修复开关
+- 实施时移除 `--verify-no-changes`，其他 workspace、include、exclude、诊断范围保持一致。再运行同范围 verify；它仅证明该组格式检查通过，不证明编译、测试或全部规范通过
+
+机械流实际选中的文件不等于规范流的全部范围：**后续规范审查覆盖用户请求的目标**，不能因某文件空白原本合规就跳过其命名或注释。
+
+## 4. 规范审查与风险分流
+
+两个审计脚本均不修改源码。小范围检查可直接输出 JSON，省去创建、读取和清理报告文件；全量规范审查使用两个，局部请求按检查类别选择：
+
+```text
+python -B <skill-root>/scripts/compliance-grep.py --scope <目录或.cs文件> --output -
+python -B <skill-root>/scripts/class-layout-check.py --scope <目录或.cs文件> --output -
+```
+
+仅整理注释时，可给 `compliance-grep.py` 加 `--rules summary_inline comment_terminal_period`，只返回相关候选；不必为此运行成员布局审计。其他限定类别按实际规则 key 选择。省略 `--rules` 仍检查全部规则，全量规范整理不能用局部选择冒充完整覆盖；summary 职责表述仍需人工判断。
+
+需要可靠区分真实注释与 raw/verbatim 字符串、XML 示例时，可选用 [Roslyn 注释检查](references/comment-syntax.md)。先读其依赖、写入范围与结果约定；它仅检查 summary 标签布局和句末句号候选，不替代其他规则，有独立构建开销，不为简单手工检查强制运行。
+
+大报告或需留存时，改用本轮独立目录下不同的 `.json` 输出路径。报告、验证夹具及构建产物均遵守本次可写范围，系统 Temp 不天然属于授权范围；`-B` 避免产生技能脚本的字节码缓存
+
+脚本不评估 MSBuild，直接传工程/解决方案会明确报错；先核实其文件集，在共同目录范围用 `--include-from <清单>` 收窄，或分组扫描已确认的链接文件。清单相对路径以清单所在目录为基准，推荐绝对路径。详见检查指南和脚本 `--help`。
+
+上述两个文本审计脚本的结果都是待确认候选，不是自动修复队列；脚本未命中不代表全面合规。逐条核实上下文，尤其是字符串/注释中的代码形状、类型判断和启发式成员分类。可选 Roslyn 的布局命中表示所选语法规则不满足，句号仍是候选；均不授权自动修改。
+
+| 修改 | 必须先检查的风险 |
+|---|---|
+| 空白、summary 布局、自然语言注释标点 | 字符串、预处理、工具指令、生成标记及授权的历史注释范围 |
+| 给控制语句加大括号 | 实际语法树、dangling else、作用域与局部变量，不能靠正则替换 |
+| 私有字段、命令属性等改名 | 全部 partial 声明、C#/XAML/配置/序列化/反射/源码生成器、`nameof` 的输出、名称冲突 |
+| 移动成员、文件或命名空间 | 初始化顺序、字段/结构布局、条件编译、链接文件、源码生成和外部类型标识 |
+| 浮点比较、枚举字符串、委托提取、StringBuilder | 属于行为或结构/性能调整，**默认只报告，不自动实施** |
+
+改名先查引用再改：优先语义重命名，辅以 `rg` 检索源码及字符串引用；零文本命中不是外部依赖不存在的证明。纯内部且证据充分的规范改名可直接实施；public API、持久化名称、绑定生成规则等需要保留兼容性，不以“编译通过”代替契约检查。
+
+成员重排保留字段及自动属性初始化器的相对执行顺序，成员的文档、属性和条件编译块必须随附，不跨 `#if` 分支随意移动。结构布局和无法证明安全的重排留在报告中；仅加 region/空行通常足够时不重写整个类体。
+
+## 5. 注释硬性约束
+
+所有新增和改写的 C# 注释都遵守以下规则；全量规范整理时也修复授权目标内已确认的存量违规，局部任务不扩展清理范围。
+
+1. **summary 只写“是什么 / 做什么”**。类和接口概括职责，方法概括目的或结果，属性概括值或状态，默认一个简短内容行。名称只是线索，先按真实返回值、状态含义及失败路径核对，再用简短短语表达；例如尝试次数不能写成成功次数。不补内部步骤、协作者、调用顺序、订阅、线程、回滚或释放细节。用“实现变化而职责不变时是否仍成立”复核
+2. **`<summary>` 与 `</summary>` 各独占一个物理 `///` 行**，内容放在中间；禁止 `/// <summary>内容</summary>`。其他 XML 标签内容短时允许单行
+3. **注释结尾不加中文 `。` 或英文句末 `.`**，涵盖 XML、普通/行尾 `//`、块注释，以及 XML 结束标签前的正文。版本号、小数、URL、文件名、成员名、缩写和省略号中的点保留，不破坏字面数据
 
 ```csharp
 /// <summary>
@@ -25,343 +103,19 @@ description: 格式化、审计和整理现有 C# 代码，统一代码风格、
 public static void StartServices()
 ```
 
-**环境前提**:
-- **Python 3.10+**(脚本用了 `list[X]` / `X | None` 等 PEP 604 类型注解)
-- **.NET SDK 6.0+**(`dotnet format` 是 .NET Core/5+ 工具,**.NET Framework 老项目**(VS2017 前的 `csproj` 老格式)用不了 dotnet format,要用 ReSharper / VS 内置格式化器,这种项目这个 skill 只能跑 Section 6 audit,跑不了阶段 A)
-- **git VCS**(Section 7 实施流程依赖 `git status` / `git checkout` / `git diff`)。SVN/Mercurial 项目只能跑 audit,Section 7 fix 流程不支持
+相同粒度的示例：类 `管理设备服务`、`InitializeAsync` 为 `异步初始化`、`ClearServices` 为 `清理服务`、`InitializationTask` 为 `初始化任务`。不要改成“接入设备状态通知，并在后台启动设备和插件初始化”或“取消插件更新并释放游戏服务”。
 
-## 工作流概览
+必要且不显然的实现原因放在相关逻辑附近，不机械搬运删掉的每一条细节；调用者必知的契约写进 `<param>`、`<returns>`、`<exception>` 或 `<remarks>`。已有有效 `<inheritdoc/>` / `<include>` 不盲目重复生成，按项目文档链确认覆盖。无法判断职责时报告缺口，不编造“处理相关逻辑”等空话。
 
-```
-阶段 A: dotnet format 机械流(Section 1-5)
-   1. 定位目标(.cs / .csproj / .sln)
-   2. dry-run → 列改动 → 用户点头
-   3. dotnet format 实施
-   4. git diff --stat 汇总
-   5. --verify-no-changes 自检
+缩短或迁移现有文档时，保留仍有效的链接及调用契约；有原文字面 `http://` / `https://` 链接可对本次基线与改后文件运行 `scripts/check-doc-preservation.py`，用法和盲区见检查指南的“注释整理”。它只提示 URL 丢失或标点变化候选，不证明内容或声明附着正确。
 
-阶段 B: 合规审计 + 实施 语义流(Section 6-8)
-   6. compliance-grep.py 抓违规 → 真违规清单
-   7. 按 🟢 低 / 🟡 中 / 🔴 高 破坏性分批 → diff 预览 → 用户挑批 → 实施 → dotnet build 验证(失败 revert)
-   8. 若实施过修改:复查本次 `<summary>` 布局与内容以及注释结尾 → 终极汇总(A + B 改了什么)
-```
+## 6. 实施、验证与交付
 
-**section 2(dry-run)、section 7(每批先预览)绝对不能跳到直接动手** —— 改文件出问题没退路,**预览+用户点头是兜底**。
-
-## 0. 先判定:是不是该由 format-csharp 处理 vs 转 code-refactor
-
-**format-csharp 处理 "改 surface" —— 代码长什么样变了,但代码"做什么"没变**:
-- ✅ 改名(`UseCmd`→`UseCommand`、`isVisible`→`_isVisible`、`AuthorAttr`→`AuthorAttribute`、中文标识符→英文)
-- ✅ 改类内顺序(字段→属性→构造→方法)、加/去 `#region`
-- ✅ 补 / 修 `<summary>` 注释、加模块头
-- ✅ 改语法糖(`enum.ToString()` → `[Description]+.GetDescription()`、匿名 delegate → 具名方法、`if (...) x;` → `if (...) { x; }`、`string +=` → StringBuilder、`double ==` → epsilon 比较)
-- ✅ 空白 / 缩进 / using 排序 / 大括号位置(dotnet format 那部分)
-
-**code-refactor 处理 "改 structure" —— 代码组织变了**:
-- ❌ "把 800 行的 `ProcessPayment` 拆成 3 个方法" → code-refactor
-- ❌ "提取一个 `Validator` 类出来" → code-refactor
-- ❌ "把 O(n²) 优化成 O(n)" → code-refactor
-- ❌ "消除这段重复逻辑" → code-refactor
-- ❌ "把这个 if/else 链改成策略模式" → code-refactor
-
-**两边都不是的**:
-- ❌ 写新代码 / 修 bug / 翻译 C# 到别的语言 / 格式化非 .cs(Razor/XAML/JSON)/ 改 .editorconfig 或规范文档本身 → 不是 format-csharp 也不是 code-refactor
-
-**模糊情况**: 比如"把命名空间和文件夹对齐"涉及移动文件 + 改 `namespace` 声明 —— 这是 surface,format-csharp 干。"把这个 class 拆成 partial 多文件"涉及改组织结构 —— 这是 structure,转 code-refactor。改名的细分(规范驱动 vs ad-hoc)见 frontmatter 描述。
-
-不确定就先反问一句,别上来就动手。
-
-## 1. 定位格式化目标
-
-`dotnet format` 接受三种粒度的输入,先搞清楚用户给的是哪种:
-
-| 用户给的 | 范围 | 命令形态 |
-|---|---|---|
-| `Foo.cs`(单个 .cs 文件) | 仅这个文件 | `dotnet format <containing-csproj> --include <relative-path>` |
-| 一组 .cs 文件 | 这些文件 | `dotnet format <containing-csproj> --include "a.cs b.cs c.cs"`(空格分隔) |
-| `MyApp.csproj` | 整个项目 | `dotnet format MyApp.csproj` |
-| `MyApp.sln` | 整个解决方案 | `dotnet format MyApp.sln` |
-| 只说"格式化 C# 代码"没指文件 | 当前目录 | 先列当前目录的 .sln/.csproj(PowerShell: `Get-ChildItem *.sln,*.csproj`;bash: `ls *.sln *.csproj 2>/dev/null`),**找到了就用,没找到就反问** |
-
-**`--include` 的路径要传 csproj 的相对路径**(绝对路径有时也行,但相对路径跨 SDK 版本最稳):用 `[System.IO.Path]::GetRelativePath($csprojDir, $csAbsPath)` 算。
-
-**关键陷阱:`dotnet format` 不能直接吃 .cs 文件** —— 它需要项目上下文(.editorconfig、analyzers、references)。单文件场景必须先找到所属 .csproj。
-
-**用 skill 自带脚本搞定**:
-```bash
-python ~/.claude/skills/format-csharp/scripts/find-csproj.py path/to/Foo.cs
-# 返回最近 .csproj 全路径(向上爬目录);找不到 exit 2
-```
-
-找不到的话告诉用户:这个 .cs 文件不属于任何 csproj,`dotnet format` 没法处理,问要不要他指定一个 csproj。
-
-## 2. Dry-run:先看会改哪些文件
-
-正式格式化之前,**先用 `--verify-no-changes --report <dir>` 跑一遍**,它会:
-- 不修改任何文件
-- 把所有"需要格式化"的位置写到 `<dir>/format-report.json`(结构化 JSON,易解析)
-- 退出码非 0 表示有需要格式化的地方
-
-```powershell
-# Windows / PowerShell —— report 落到 TEMP,避免污染项目目录
-dotnet format <target> --verify-no-changes --report $env:TEMP --verbosity quiet
-# 生成 $env:TEMP\format-report.json,exit code 0=已干净,非0=有要改的
-```
-
-```bash
-# bash
-dotnet format <target> --verify-no-changes --report /tmp --verbosity quiet
-# 生成 /tmp/format-report.json
-```
-
-**`--report` 落到 TEMP 而不是 `.`** —— 否则 `format-report.json` 会落到当前目录(通常是项目根),git status 会冒出一个 untracked 文件,有洁癖的项目会嫌恶心。落到 TEMP 既不污染,又方便后续脚本读。
-
-**为什么用 `--report`** — 没它的话 `--verify-no-changes` 把每个问题当 error 打一行 stderr,大项目淹没终端;`--report` 输出干净 JSON。**别用 stdout/stderr 做判断,看 exit code + JSON 即可**。
-
-**JSON 注意点**:同一个文件会重复出现(whitespace/style/analyzers 三个子阶段各输出一份)。**别手工解析,直接跑脚本**:
-
-```bash
-python ~/.claude/skills/format-csharp/scripts/summarize-format-report.py
-# 自动 dedup by FilePath + 聚合 DiagnosticId(WHITESPACE/ENDOFLINE/IMPORTS/IDE0XXX 等)
-# 加 --json 输出结构化 JSON 供后续编程处理
-```
-
-**展示给用户的格式建议:**
-```
-🔍 dry-run 完成,以下 N 个文件需要格式化:
-
-  src/Program.cs       IMPORTS(using 排序)、WHITESPACE × 8、ENDOFLINE × 6
-  src/Helper.cs        WHITESPACE × 12、ENDOFLINE × 11
-  ...
-
-要全部格式化吗?还是要排除某些文件 / 某种诊断类别?
-```
-
-**用户想排除某些文件**,加 `--exclude`(空格分隔的相对路径,支持 glob):
-```bash
-dotnet format <target> --exclude "src/Generated/** src/Vendor/**"
-```
-
-**用户只想修某类问题**(比如只修缩进不动 using 排序),用子命令缩范围(见第 3 节)。
-
-## 3. 实施:正式格式化
-
-确认范围后,去掉 `--verify-no-changes` 跑一遍。**推荐用 `--verbosity quiet`,完全静默,只看 exit code 0/非 0**:
-
-```bash
-dotnet format <target> --verbosity quiet
-```
-
-如果出问题需要排查,再切到 `--verbosity diagnostic` 看每条规则的具体动作。**别一上来就 diagnostic**,99% 情况下你不需要那些信息。
-
-常用 flag(按需加):
-- `--verbosity quiet|minimal|normal|detailed|diagnostic` —— 默认 minimal,实际格式化推荐 quiet
-- `--severity warn` —— 只修 warn 及以上严重度的问题(默认是 warn,可以放宽到 `info` 或收紧到 `error`,**不建议设 error**,会让本来只是 warn 的格式问题导致命令非 0 退出)
-- `--no-restore` —— 项目已经 restore 过了,跳过那一步(快很多)
-- `--include <file/dir>` —— 限定范围(单文件场景必备,用项目相对路径)
-- `--exclude <file/dir>` —— 反向排除
-- `--include-generated` —— 默认 false。**不要随便加**,生成代码格式化了下次 build 又会被覆盖
-
-`dotnet format` 内部有三个子命令(`whitespace` / `style` / `analyzers`),默认三个都跑。**用户明确说"只修空白别动 using"**之类的子集请求,详见 [`references/compliance-check.md`](./references/compliance-check.md) 附录"dotnet format 子命令"。
-
-## 4. 汇总:告诉用户改了什么
-
-格式化完跑收尾汇总。**两种来源,选一个**:
-
-**(a) 仓库是 git,优先用 git(最直观):**
-```bash
-git diff --stat                    # 文件级统计 +N -M
-git diff --name-only               # 只列文件名
-git diff --shortstat               # 一行总体 +/- 行数
-```
-
-把改了的文件列出来,**每个文件配一句话说改了什么**。读 diff 自己判断,典型类别:
-- "tab 缩进 → 4 空格"
-- "末尾空白清理"
-- "using 重新排序(System.* 优先)"
-- "类/方法的 `{` 换到下一行"
-- "操作符两侧补空格(`a=b` → `a = b`)"
-- "行尾 CRLF / LF 统一"
-
-**(b) 没 git,复用 dry-run 时的 `format-report.json`**(第 2 节已经生成过):按 `FilePath` 去重,统计每个文件的 `DiagnosticId` 分布,直接报。
-
-汇总格式建议:
-```
-✅ 格式化完成,改了 N 个文件:
-
-src/Program.cs       using 重排 + 缩进 tab → 4 空格 + 操作符空格
-src/Helper.cs        参数列表空格 + 方法体重新缩进
-src/Models/User.cs   命名空间与路径对齐
-
-跑的命令: dotnet format Demo.csproj --verbosity quiet
-没改 .editorconfig、.csproj 或任何 .cs 之外的文件。
-```
-
-**关键:不要把 dotnet format 自己的 stdout 原样贴给用户** —— 那里都是 "已将代码文件 X 格式化" / "Formatted code file 'X'"(取决于系统 locale)级别的状态信息,既冗余又不直观。git diff 或 JSON report 才是干净来源。
-
-## 5. 收尾自检
-
-最后跑一次 `--verify-no-changes`,**应该退出码为 0**,表示已经干净:
-
-```bash
-dotnet format <target> --verify-no-changes
-echo "exit=$?"
-```
-
-非 0 退出码 = `dotnet format` 自己修不了的 analyzer 警告:**不要在这里改代码**。命名/`<summary>`/写法禁令类警告(IDE1006/SA1600/CA1707 等)进 Section 6 audit 处理;死代码/复杂度类(IDE0051/CA1822 等)转 code-refactor;真改不掉的把告警贴给用户。**如果只跑了阶段 A 没跑 B**,告诉用户"剩下这堆告警按规范跑一遍能处理大部分"。
-
-## 6. 代码规范合规审计(语义流第一步 — 找违规)
-
-`dotnet format` 已经把 `.editorconfig` 能描述的部分修了,但**风格指南通常有一堆 dotnet format 处理不了的语义规则** —— `Cmd → Command` 缩写禁令、中文标识符禁令、私有字段 `_` 前缀、自定义 Attribute/Exception 后缀、控件名前缀、`<summary>` 注释覆盖率、`enum.ToString()`/匿名委托/浮点 `==` 等写法禁令、类内成员顺序、反义词组配对。
-
-**规则来源 — 内嵌在 skill 里,跨项目通用:**
-
-[`references/代码规范.md`](./references/代码规范.md) 是合规审计的唯一权威来源。**不会去搜用户项目里的同名文件**。要改规则就直接编辑这个文件,改完立即生效。
-
-**步骤(从拿到目标到 audit 报告):**
-
-```
-(1) Read references/代码规范.md          ← 规则吸进来
-(2) 跑 scripts/compliance-grep.py       ← 一次抓所有候选 + 已应用确定性过滤
-(3) Read references/compliance-check.md  ← 学每条规则的 filter_hint + 如何 fix
-(4) 对 enum_tostring_suspect 这类需要语义判断的,打开命中文件读上下文
-(5) 出 audit 报告(下面格式)
-```
-
-**两个脚本并行跑**(各管一摊):
-```bash
-# 1. 12 条 grep 规则(命名 / 中文标识符 / 写法禁令 / summary 单行 / 注释句号结尾 等)
-python ~/.claude/skills/format-csharp/scripts/compliance-grep.py --scope path/to/src
-# 输出 $TEMP\compliance-audit.json；enum_tostring 和两个注释候选仍需 LLM 读上下文
-
-# 2. 4 条 class body 解析规则(成员顺序 / region 缺失 / region 间空行 / 成员间空行)
-python ~/.claude/skills/format-csharp/scripts/class-layout-check.py --scope path/to/src
-# 输出 $TEMP\class-layout-audit.json,findings 含 file:line:rule:message
-```
-
-**audit 报告必须按破坏性分级(给 Section 7 实施用):**
-
-判定流程:对每条违规,**先用 Grep 工具扫 identifier 在整个 solution 的出现位置**(`.cs` + `.xaml` + `.razor` + `.cshtml` + `.json` + `.resx` 等 —— 脚本只扫 `.cs`,字符串引用必须 LLM 手工查),再按下表分级:
-
-| 档 | 判据 | 典型规则 |
-|---|---|---|
-| 🟢 低 | 改动只影响声明本身 / 同 class 内部 / 单 method 内 | 私有字段加 `_`、`if/for/while` 加 `{ }`、加 `<summary>`、`<summary>` 单行→多行、注释结尾去句号、浮点 `==` 改 epsilon、`string +=` 改 StringBuilder、类内重排/补 region |
-| 🟡 中 | 同工程内多处源码引用(可 Grep 验证),含 XAML/.razor binding | ICommand `Cmd` → `Command`(必查 XAML)、自定义 Attribute/Exception 改名、`enum.ToString()` → `[Description]`、匿名 delegate → 具名方法 |
-| 🔴 高 | 外部 API / 字符串-based 引用 / 跨工程 / 语义判断 | public class/interface/enum 改名、中文标识符→英文(需用户拍板目标命名)、测试方法改名 |
-
-**典型 grep 调用**(中/高破坏性必跑,没跑直接判级 = 蒙数据 = 误判):
-```
-Grep("XxxCmd"   in *.xaml *.axaml *.razor *.cshtml)   # ICommand binding
-Grep("[XxxAttr" in *.cs)                              # Attribute 用法
-Grep("中文名"   in *.cs *.xaml *.json *.resx)         # 中文 identifier 全引用
-```
-
-**audit 报告格式** —— 完整 mock 范例在 [`references/compliance-check.md`](./references/compliance-check.md) Section 5。骨架:总览 (🟢/🟡/🔴/ℹ️ 计数) → 按破坏性分级的详单(每条违规给 file:line + 改法 + 引用扫描结果) → 规则冲突单独列。
-
-**关键原则:**
-- **Grep 命中要开文件确认** —— 脚本已用确定性 filter 砍掉绝大多数误判,但 `enum.ToString()` 必须读上下文判断左侧类型；`summary_inline` 和 `comment_terminal_period` 也要排除块注释 / 多行字符串内的同形文字，并确认英文点号确实是句末标点，不能盲信。
-- **规则冲突单独列**,不混在违规里 —— 这是用户决策项,不是 fix 项
-- **不要修改 `references/代码规范.md`** —— 即使发现规范有自相矛盾,在报告"规则冲突"那一节指出,不替用户改
-
-## 7. 按破坏性分批实施(语义流第二步 — 改)
-
-audit 完直接进 Section 7。**核心节奏:每批先 diff 预览 → 用户挑批 → 实施 → `dotnet build` 验证 → 失败 revert 该批**。
-
-### 7.1 前置条件 + 标准操作流
-
-**进 Section 7 前**:跑 `git status --porcelain`,**非空就告诉用户先 commit 或 stash**(`git checkout --` revert 会污染用户原有 uncommitted 改动)。**不要替用户 stash/commit**。
-
-**每批走这一套**:
-```
-1. LLM 用 Edit 工具按 audit 清单把这批改动一次性应用到 working tree
-2. git diff --stat + git diff 给用户预览
-3. 用户表态:
-   - "全部 OK" → 进 4
-   - "排除 ___"  → 必须搞清楚是 (a) 整条规则跳过 / (b) 某文件不改 / (c) 某条具体改动不改 —— **不确定就反问**:
-     - (a) → `git checkout -- <本规则触动的所有文件>`,标记规则跳过
-     - (b) → `git checkout -- src/Foo.cs`,保留其他,回 2 重新预览
-     - (c) → Edit 撤该条改动,保留其他,回 2 重新预览
-   - "全部撤回" → `git checkout -- <本批触动的所有文件>`,跳过该批
-4. dotnet build —— 0=进 5,非 0=`git checkout -- <touched>` revert 该批,报错给用户
-5. 跑测试(若项目有测试):**先反问用户测试怎么跑**(`dotnet test <sln>` / `dotnet test <Tests.csproj>` / `vstest.console.exe ...` / NUnit / 其他 runner —— 不要假设)。全过=进下一批,挂了=revert 该批,报错。**如果用户说"先跳过测试"或项目没测试,只 build 验证就行**
-```
-
-### 7.2 各批的默认动作
-
-| 批次 | 默认做法 |
-|---|---|
-| 🟢 低 | **预先全部应用 + diff 预览 + 一键 OK** —— 100 个私有字段改名逐条问是浪费 |
-| 🟡 中 | **按规则一组一组** —— 同一条规则一批应用 + diff(必须看到 XAML/.razor binding 也跟着改) + 用户 OK |
-| 🔴 高 | **逐条来** —— 先 grep 影响文件清单、再预览、用户单独 OK。**中文→英文必须先让用户拍板目标命名** |
-| ℹ️ 规则冲突 | 不实施。只在 audit 报告列,用户后续手动改规范或 .editorconfig |
-
-### 7.3 改完之后 + per-rule 修复细则
-
-各批之间不需要单独 commit —— 改动在 working tree 累积,出错 revert 只动当批文件。**Section 7 全部跑完也不替用户 commit**,让用户自己看 final state 决定怎么拆。
-
-每条规则具体改法(grep 哪些引用、补哪些 using、何时反问用户) → 见 [`references/compliance-check.md`](./references/compliance-check.md) Section 7。关键点 highlight:
-- **改名**:`Edit` 改声明 → grep 引用 → `Edit` 同步;XAML/.razor binding 同改
-- **enum.ToString() → `.GetDescription()`**:**先 grep `GetDescription()` 已有否**,没有**反问用户**在哪建,不默认新建文件
-- **加 / 改 `<summary>`**:默认用一个简短内容行，只概括声明“是什么 / 做什么”；清楚名称的直接中文表达（如 `StartServices` → “开启服务”）就是合格注释，不为追求“有信息量”扩写内部步骤。写不出准确职责时标“建议手工补”，不凑数写“处理相关逻辑”等废话。凡是新增或修改的 `<summary>` 都立即按文首的硬性布局规则写成多行，内容结尾不加句号，不先产生违规形式再留给后续修理
-- **类内布局**(顺序/region/间隔):跑 `class-layout-check.py` 拿 findings,**重排是文件内部的大改动**,用 Edit 重写整段类体 + dotnet build 验证(改动不跨文件,build 通过基本就 OK)。**audit findings 是必要不充分条件** —— audit 报的肯定要改,**但 audit 没报的不代表合规**。脚本基于正则启发式分类,可能漏算 `[DllImport] extern` 方法 / 多行 attribute decoration / nested 类内 lambda 等,导致某 group 实际有 N 个成员但 audit 只算到 N-1 个。**每个修类的 LLM 任务,改完 audit findings 后必须打开 JSON 里的 `class_layouts` 看该 class 的 group 全景**(每个非空 group 的 count / in_region / status),跟实际文件里成员数对一下,发现差异就是 parser miss,主动补 region —— 不要"audit 没标就跳过"
-
-**凡本次实施过 C# 文件修改，最终交付前必须做 `<summary>` 布局与内容以及注释结尾复查**。默认范围限定为本次新增或改写的注释；若用户要求全量注释合规审计，才检查目标范围内的全部注释:
-
-```bash
-git diff --unified=20 -- '*.cs'
-python ~/.claude/skills/format-csharp/scripts/compliance-grep.py --scope <scope> --include-from <changed-cs-files.txt> --quiet
-```
-
-单文件可直接把该 `.cs` 文件作为 `--scope`，省略 `--include-from`。脚本辅助检查 `<summary>` 布局，以及常见的独占行 / 行尾 `//`、`///`、块注释和 XML 结束标签前的句号，**不能判断内容是否过度，也不能完整理解 C# 注释边界或点号语义**。必须逐条打开 diff 中新增或改写的 `<summary>`、其所属声明以及必要的实现上下文，确认它只概括职责 / 目的 / 所表示的值，并通过“内部实现变化而职责不变时仍然成立”的测试；实现步骤只在必要且不显然时留在对应逻辑附近。再检查全部新增或改写的注释结尾，确认未使用句号；版本号、小数、URL 等内部点号不动。最后打开脚本报出的 `summary_inline` 和 `comment_terminal_period` 候选上下文，排除块注释或多行字符串里的同形文字，并确认英文点号不是缩写或字面数据的一部分。默认两条腿流程或本次包含注释合规时，**内容、布局和结尾真违规都必须为 `0` 才能交付**。如果用户明确只做阶段 A 或排除注释变更，不扩大范围清理历史注释；但必须确保本次 diff 没有新增或改坏注释，并单独报告存量候选。
-
-## 8. 全流程终极汇总
-
-阶段 A + B 都跑完后,给用户一份合并报告。骨架:
-
-- ✅ / ⚠️ 头部:总体状态
-- 阶段 A 改了 N 个文件,主要修了什么
-- 阶段 B 改了 M 个文件 × P 处违规,按 🟢/🟡/🔴 分类计数
-- 跳过未改:列出原因(规则冲突 / 模块头默认 skip 等)
-- `<summary>` 布局与内容、注释结尾复查结果(实施过 C# 修改时)
-- dotnet build / dotnet test 结果
-- 下一步:建议用户怎么 commit(拆 2-3 个 commit 方便 review)
-
-完整 mock 范例见 [`references/compliance-check.md`](./references/compliance-check.md) Section 8。
-
-**重要:不替用户 commit**。让他自己看完最终 working tree 决定怎么拆。
-
-## 常见坑 + 故障排查
-
-环境类:
-- **dotnet 命令找不到** —— `dotnet --version` 先验一遍。Windows 装 .NET SDK,Linux 装 `dotnet-sdk-8.0/9.0/10.0` 等
-- **没 .editorconfig** —— `dotnet format` 用 .NET 内置默认规则(4 空格、CRLF 跟系统),可能不合预期。用户没 .editorconfig 但说"按项目风格",先反问或建议 `dotnet new editorconfig`
-- **`Unable to load Workspace`** —— restore 失败 / SDK 版本错。先 `dotnet restore`,看 global.json 的 SDK 版本
-
-性能 / 范围类:
-- **慢得离谱** —— 大项目第一次 restore + 加载 analyzer 是 5-30 秒。加 `--no-restore` / 限 `--include` 范围加速
-- **改了不期望的文件**(生成代码、迁移)—— 加 `--exclude "Migrations/** Generated/**"`,或 .editorconfig 设 `generated_code = true`
-- **`Could not find any project or solution`** —— 当前目录没 .csproj/.sln 且没显式传,显式传一个或 cd 过去
-- **`MSB1009: Project file does not exist`** —— .csproj 路径写错,用绝对路径
-
-行为 / locale 类:
-- **PowerShell 下别用 `2>&1`** —— PS 5.1 把每个 stderr 行包成 `NativeCommandError`,`$LASTEXITCODE` 判断会乱。直接看 exit code + `--report` JSON
-- **CRLF/LF 总被改回** —— .editorconfig 没设 `end_of_line`,或 .gitattributes 的 autocrlf 在干扰。在 .editorconfig 写死 `end_of_line = lf`
-- **dotnet format 状态输出受 locale 影响** —— 中文 Windows 是"已将代码文件 X 格式化",英文是 `Formatted code file 'X'`。**别 grep 字符串判断**,看 exit code 或 JSON
-- **`.cs` 不在任何 .csproj 里**(scratch 脚本)—— dotnet format 处理不了,告诉用户这个限制
-- **项目编译不过** —— dotnet format 不要求 emit(Roslyn 分析够),但严重 syntax error 会让格式化结果不准,先让用户修
-
-收尾类:
-- **`--verify-no-changes` 永远非 0** —— 有 analyzer 规则修不掉(需要语义改)。走 Section 5 分级路由:命名/`<summary>`/写法禁令类进 Section 6 audit,死代码/复杂度类转 code-refactor。**别靠改 `--severity` 凑** —— 那是隐藏问题
-- **`Hangs forever on "Loading workspace"`** —— 大 sln 第一次 + analyzer NuGet 下载,等;或缩范围到单 csproj
-
-## 不该做的事
-
-**阶段 A**:不要不 dry-run 直接改 / 不要静默加 `--include-generated` / 不要顺手改 .editorconfig / 不要把 `--severity` 提到 `error`。
-
-**阶段 B**:不要按 audit 报告"擅自决定"中文 → 英文的目标命名(必须让用户拍板)/ 不要为了凑数写废话或过度展开的 `<summary>`(写不出准确职责就标"建议手工补")/ 不要修改 `references/代码规范.md`(除非用户明说加规则)。
-
-**通用边界**:
-- **拆方法 / 优化算法 / 合并重复逻辑 / 提取类 → 转 code-refactor**。format-csharp 只改 surface,不改 structure。详见 Section 0。
-- **改名**:规范驱动 → format-csharp;ad-hoc("我觉得名字不好") → code-refactor。
-
-(本节其他护栏已在前面 section 强调过:dry-run 必跑、Section 7 前 git status 干净、每批 build 验证、不替用户 commit 等)
+- 按小而完整的修改批次执行，同一次改名同步所有必要引用。不要为每个私有字段重复确认，也不要预先应用未授权的高风险变更再让用户撤回
+- 对照本次基线检查 diff，保留用户原有改动。失败时先判断是否基线问题；需要回退时仅撤销**自己本批的具体修改**，禁止用整文件 `git checkout --` / `git restore` 覆盖原有或前批成果。冲突无法安全分离时停下说明
+- 通过仓库脚本/CI/测试工程确定适用命令；按风险跑格式 verify、相关项目 build、受影响测试/绑定/序列化验证。未改行为也不代表不需测试；无工具或基线失败时准确报告未验证部分，不谎称通过，也不强制等待用户提供显而易见的测试命令
+- 优先复用已有测试或同一份改前/改后探针。自建验证先确认测试装置本身有效；按工具语义区分预期结果与执行错误，未预期的 PowerShell 异常、执行错误或断言失败必须使该项验证失败，不能报错后仍打印 PASS。探针失败时先区分代码变化与断言/调用错误，不临时叠加多套编译、反射或指纹比较来追求“完全等价证明”
+- 打开所有本次新增/改写的 summary 及其声明复查内容，核对标签物理换行、注释句尾标点。脚本候选需回看真实上下文；既不能批量删 URL 的点，也不能把真实块注释当作应排除的误报
+- 完成授权修改、最终 diff/注释复核及相应风险验证后交付。相关源码/配置未变且没有新证据时，不重复相同审计或另建同用途验证；已确认的启发式误报记录依据即可，不以候选清零为结束条件
+- 清理临时产物不是交付前提。只处理本轮记录的确切路径，不按公共前缀搜集其他目录；清理被策略拒绝后保留并说明，不改用其他 API、构建清理命令或逐文件删除继续相同操作
+- 最终简述修改范围、主要类别、实际验证结果、未改项及原因。区分已确认违规、未确认候选、规则冲突和工具失败，不报虚构合规率。不自动提交或改技能规则

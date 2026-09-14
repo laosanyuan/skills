@@ -5,15 +5,19 @@ Thumbs.db
 .idea/
 .vscode/
 
-# Python (if you later run any scripts here)
+# Python
 __pycache__/
 *.pyc
 *.pyo
 .venv/
 venv/
 
+# .NET build outputs
+bin/
+obj/
+
 # Packaged skill files (regenerated from SKILL.md, don't commit)
 *.skill
 
-# Local dev workspace (if you re-add evals later)
+# Local evaluation workspace
 workspace/

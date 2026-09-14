@@ -1,46 +1,36 @@
-# CLAUDE.md
+# 仓库开发指引
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+## 范围与结构
 
-## 这个仓库是什么
+本仓库是四个可独立安装的个人技能：
 
-我的 Claude Code skill 合集。每个子目录是**一个独立的 skill**,自包含,目前有:
+- `prd-writer`：编写和迭代产品需求
+- `tech-design-writer`：需求驱动的技术设计和任务拆分
+- `code-refactor`：保持行为的重构与只读异味检查
+- `format-csharp`：C# 格式、命名、布局和注释整理
 
-- [prd-writer/](prd-writer/) — 通过对话写 PRD
-- [tech-design-writer/](tech-design-writer/) — 把 PRD 翻成技术设计
+每个目录至少含 `SKILL.md`（YAML frontmatter + 执行说明），按实际需要附带 `references/` 和 `scripts/`。这些都是产品文件，安装时必须复制完整包；不能假设每个技能只有一个文件。
 
-每个 skill 目录里**只有一个文件**:`SKILL.md`(YAML frontmatter + 指令)。这是唯一需要编辑的产品文件。
+## 编辑约定
 
-## 改某个 skill 时
+- `name` 与目录名一致；`description` 保持一两句，说明用途与必要边界，不堆满触发词和详细流程
+- 入口保留能力、权限边界、核心流程和资源路由；条件性细节放参考文件，简单技能不为形式拆文件
+- 尊重用户明确的动作和范围：明确修改无需重复审批，只读请求不实施；重要歧义或新增契约风险再澄清
+- 不以具体行数、功能数或单个示例代替判断；不编造用户确认、业务默认值、测试通过或性能实测
+- 新增脚本需有重复使用价值，优先标准库、自包含、只读检查、明确输入输出和失败码；启发式候选不能冒充准确语义分析
+- 修改规范时同步入口、参考、脚本元数据和调用示例，避免出现互相矛盾的多份规则
+- 保留用户现有改动；不自动 commit、stash 或整文件还原
 
-直接编辑 `<skill-name>/SKILL.md`。结构上要注意:
+## 验证
 
-- **YAML frontmatter 的 `description`** 决定 skill **何时被 Claude 自动调用**。改 description 影响触发判断 —— 措辞要既能"捕获"该触发的场景,又能"放过"近似但不该触发的(详见 SKILL.md 里描述自己怎么写的指引,或参考已有 skill 的 description)
-- **正文** 决定被触发后**怎么做事**
-- 推荐 SKILL.md 控制在 500 行内,超过模型可能跳读
+有可用 skill-creator 工具链时运行真实 `quick_validate.py`，依赖缺失则明确报告或在临时目录安装真实依赖，不伪造 YAML 模块或验证结果。
 
-## 新增 skill
+检查 Markdown 链接、围栏、资源完整性；脚本需要实际输入/输出、失败路径与边界回归，不能只匹配代码文字。复杂改动通过独立代理在隔离样例中执行真实任务，检查产物和越界行为。
 
-```
-mkdir my-new-skill
-# 写 my-new-skill/SKILL.md
-# 在 README.md 顶部表格补一行
-```
+测试、评估、fixture 和缓存默认放隔离临时目录，不放进可安装技能包或仓库。新增产品资源需在入口说明用途，不添加无效占位文件。修改包结构时同步根 README。
 
-文件夹名 = skill name(与 YAML frontmatter 里 `name` 字段一致)。
+## 本地安装
 
-## 安装到 Claude Code
+仅在用户要求安装时同步到实际配置的技能目录。当前本机使用 Codex 的 `C:\Users\yhong\.codex\skills` 和 Claude 的 `C:\Users\yhong\.claude\skills`；其他环境先确认实际位置，不硬编码到技能内部。
 
-```
-# macOS / Linux
-cp -r <skill-name> ~/.claude/skills/
-
-# Windows
-xcopy <skill-name> C:\Users\<you>\.claude\skills\<skill-name>\ /E /I
-```
-
-重启 Claude Code,会话里说出 description 描述的触发短语就会自动调用。
-
-## 这个仓库不包含什么
-
-为了精简上传内容,**测试 / 评估 / fixture / grader 等开发期资源没纳入仓库**。如果以后需要做迭代验证,可以参考 [Anthropic skill-creator](https://github.com/anthropics/skills) 的 evals 工作流自己搭。
+已有安装先检查差异并备份，按明确的四个技能子目录复制完整包，保留无关文件；校验源文件与安装文件哈希及引用资源。安装不需要提交仓库，不运行文档里不存在的打包模块。
